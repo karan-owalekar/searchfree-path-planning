@@ -7,7 +7,8 @@ import pygame
 from pathcircuit.grid import Grid, SENTINEL
 from pathcircuit.core.pipeline import build_pathcircuit_oracle
 from pathcircuit.core.oracle import (
-    Oracle, query_distance, reconstruct_path, precompute_goal_expansion,
+    Oracle, query_distance, reconstruct_path,
+    precompute_goal_expansion, precompute_all_block_dists,
 )
 from pathcircuit.compare.runner import run_comparison
 from pathcircuit.ui import theme
@@ -211,8 +212,9 @@ class App:
 
         t0 = time.perf_counter()
         goal_exp = precompute_goal_expansion(self._oracle, goal)
-        dist = query_distance(self._oracle, start, goal, goal_exp)
-        path = reconstruct_path(self._oracle, start, goal, goal_exp)
+        block_dists = precompute_all_block_dists(self._oracle, goal_exp, goal)
+        dist = query_distance(self._oracle, start, goal, block_dists=block_dists)
+        path = reconstruct_path(self._oracle, start, goal, block_dists=block_dists)
         query_ms = (time.perf_counter() - t0) * 1000.0
 
         if dist >= SENTINEL:

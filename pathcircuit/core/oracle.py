@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from pathcircuit.core.tropical import SENTINEL, tropical_add
+from pathcircuit.core.tropical import SENTINEL, tropical_add, minplus_mv
 from pathcircuit.core.base_block import BaseBlock, BOUNDARY_INDICES
 from pathcircuit.core.hierarchy import MergeNode, BlockLike
 from pathcircuit.grid import Grid
@@ -21,6 +21,9 @@ class Oracle:
     ancestor_chains: dict[tuple[int, int], list[MergeNode]] = field(
         default_factory=dict, repr=False
     )
+
+    # Root of the hierarchy tree (None for single-block grids).
+    root: MergeNode | None = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +56,43 @@ def _build_ancestor_chains(root: MergeNode) -> dict[tuple[int, int], list[MergeN
 
 
 # ---------------------------------------------------------------------------
-# Search-free hierarchical expansion
+# Core min-plus expansion primitive
+# ---------------------------------------------------------------------------
+
+def _expand_single_node(node: MergeNode, d: dict[tuple[int, int], int]) -> None:
+    """Expand distances in *d* through a single node's D_global table.
+
+    Pure algebraic: d_new[k] = min( d[k], min_b( d[bridge_b] + D_global[bridge_b, k] ) )
+    Uses JIT-compiled kernel when available.
+    """
+    if node.D_global_cells is None:
+        return
+
+    cells = node.D_global_cells
+    n = len(cells)
+
+    bridge_idx: list[int] = []
+    bridge_d: list[int] = []
+    for i, c in enumerate(cells):
+        if c in d:
+            bridge_idx.append(i)
+            bridge_d.append(d[c])
+
+    if not bridge_idx:
+        return
+
+    bi = np.array(bridge_idx, dtype=np.int64)
+    bd = np.array(bridge_d, dtype=np.int64)
+    d_new = minplus_mv(node.D_global, bi, bd, n)
+
+    for k in range(n):
+        v = int(d_new[k])
+        if v < d.get(cells[k], SENTINEL):
+            d[cells[k]] = v
+
+
+# ---------------------------------------------------------------------------
+# Search-free hierarchical expansion (chain-based, kept for goal_exp)
 # ---------------------------------------------------------------------------
 
 def _expand_through_hierarchy(
@@ -66,40 +105,81 @@ def _expand_through_hierarchy(
     Pure algebraic computation -- no search involved.
     """
     d = dict(initial)
-
     for node in chain:
-        if node.D_global_cells is None:
-            continue
-
-        cells = node.D_global_cells
-        n = len(cells)
-
-        # Collect bridge cells: those already reachable AND present in this
-        # node's D_global.
-        bridge_idx: list[int] = []
-        bridge_d: list[int] = []
-        for i, c in enumerate(cells):
-            if c in d:
-                bridge_idx.append(i)
-                bridge_d.append(d[c])
-
-        if not bridge_idx:
-            continue
-
-        # Vectorised min-plus: d_new[k] = min_b (bridge_d[b] + D_global[b, k])
-        bi = np.array(bridge_idx)
-        bd = np.array(bridge_d, dtype=np.int64)
-        D_sub = node.D_global[bi, :].astype(np.int64)       # (|bridges|, n)
-        sums = bd[:, np.newaxis] + D_sub                     # broadcast
-        np.clip(sums, 0, SENTINEL, out=sums)
-        d_new = np.min(sums, axis=0)                         # (n,)
-
-        for k in range(n):
-            v = int(d_new[k])
-            if v < d.get(cells[k], SENTINEL):
-                d[cells[k]] = v
-
+        _expand_single_node(node, d)
     return d
+
+
+# ---------------------------------------------------------------------------
+# Top-down tree walk for full precomputation
+# ---------------------------------------------------------------------------
+
+def _walk_and_expand(node: BlockLike, d: dict[tuple[int, int], int]) -> None:
+    """DFS top-down: expand *d* at this node, then recurse to children.
+
+    Each hierarchy node is visited exactly once, eliminating redundant work
+    that per-block reverse expansions would duplicate.
+    """
+    if isinstance(node, BaseBlock):
+        return
+
+    assert isinstance(node, MergeNode)
+    _expand_single_node(node, d)
+
+    if node.h_merge_left is not None:
+        _expand_single_node(node.h_merge_left, d)
+        _expand_single_node(node.h_merge_right, d)
+        for child in (node.h_merge_left.child_left, node.h_merge_left.child_right,
+                      node.h_merge_right.child_left, node.h_merge_right.child_right):
+            _walk_and_expand(child, d)
+    else:
+        for child in (node.child_left, node.child_right):
+            _walk_and_expand(child, d)
+
+
+_BI = np.array(BOUNDARY_INDICES, dtype=np.int32)
+
+
+def precompute_all_block_dists(
+    oracle: Oracle,
+    goal_exp: dict[tuple[int, int], int],
+    goal: tuple[int, int],
+) -> dict[tuple[int, int], np.ndarray]:
+    """Precompute d(cell, goal) for every cell in every base block.
+
+    Single top-down pass through the hierarchy tree propagates goal distances
+    to all boundary cells, then each block's intra-block APSP matrix converts
+    boundary distances to per-cell distances.
+
+    Returns { (block_row, block_col): int64[16] }.
+    """
+    d = dict(goal_exp)
+
+    if oracle.root is not None:
+        _walk_and_expand(oracle.root, d)
+
+    gr, gc = goal
+    g_block = (gr // 4, gc // 4)
+    g_local = (gr % 4) * 4 + (gc % 4)
+
+    result: dict[tuple[int, int], np.ndarray] = {}
+    for br, row in enumerate(oracle.base_blocks):
+        for bc, bb in enumerate(row):
+            btg = np.empty(12, dtype=np.int64)
+            for b in range(12):
+                btg[b] = d.get(bb.boundary_cells[b], SENTINEL)
+
+            D_to_b = bb.D[:, _BI].astype(np.int64)
+            sums = D_to_b + btg[np.newaxis, :]
+            np.clip(sums, 0, SENTINEL, out=sums)
+            dists = np.min(sums, axis=1)
+
+            if (br, bc) == g_block:
+                dists = np.minimum(dists, bb.D[:, g_local].astype(np.int64))
+
+            result[(br, bc)] = dists
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +194,17 @@ def build_oracle(
 ) -> Oracle:
     if isinstance(root, MergeNode):
         chains = _build_ancestor_chains(root)
+        root_node: MergeNode | None = root
     else:
         chains = {}
+        root_node = None
 
     return Oracle(
         base_blocks=base_blocks,
         N=N,
         grid=grid,
         ancestor_chains=chains,
+        root=root_node,
     )
 
 
@@ -159,9 +242,19 @@ def query_distance(
     s: tuple[int, int],
     g: tuple[int, int],
     goal_expansion: dict[tuple[int, int], int] | None = None,
+    block_dists: dict[tuple[int, int], np.ndarray] | None = None,
 ) -> int:
     if s == g:
         return 0
+
+    # Fast path: precomputed block dists give O(1) lookup
+    if block_dists is not None:
+        sr, sc = s
+        bk = (sr // 4, sc // 4)
+        bd = block_dists.get(bk)
+        if bd is not None:
+            return int(bd[(sr % 4) * 4 + (sc % 4)])
+        return SENTINEL
 
     sr, sc = s
     gr, gc = g
@@ -170,29 +263,24 @@ def query_distance(
     bb_s = oracle.base_blocks[s_br][s_bc]
     s_local = (sr % 4) * 4 + (sc % 4)
 
-    # Same base block: start with the local (intra-block) distance
     if s_br == gr // 4 and s_bc == gc // 4:
         g_local = (gr % 4) * 4 + (gc % 4)
         best = int(bb_s.D[s_local, g_local])
     else:
         best = SENTINEL
 
-    # Source-side: local distances to boundary cells
     initial_s: dict[tuple[int, int], int] = {}
     for a in range(12):
         d = int(bb_s.D[s_local, BOUNDARY_INDICES[a]])
         if d < SENTINEL:
             initial_s[bb_s.boundary_cells[a]] = d
 
-    # Expand source upward through the hierarchy (search-free)
     chain_s = oracle.ancestor_chains.get((s_br, s_bc), [])
     d_from_s = _expand_through_hierarchy(chain_s, initial_s)
 
-    # Goal-side expansion (precomputed or on-demand)
     if goal_expansion is None:
         goal_expansion = precompute_goal_expansion(oracle, g)
 
-    # Combine: d(s, g) = min_c (d_from_s[c] + d_to_g[c])
     for cell, ds in d_from_s.items():
         dg = goal_expansion.get(cell, SENTINEL)
         if ds < SENTINEL and dg < SENTINEL:
@@ -204,53 +292,6 @@ def query_distance(
 
 
 # ---------------------------------------------------------------------------
-# Block-level distance cache for fast reconstruction
-# ---------------------------------------------------------------------------
-
-_BI = np.array(BOUNDARY_INDICES, dtype=np.int32)
-
-
-def _block_goal_dists(
-    oracle: Oracle,
-    br: int,
-    bc: int,
-    goal_exp: dict[tuple[int, int], int],
-    goal: tuple[int, int],
-) -> np.ndarray:
-    """Return a 16-element int64 array: d(cell, goal) for every cell in block (br, bc).
-
-    Works by reverse-expanding goal_exp through the block's ancestor chain
-    (root → leaf) to obtain d(boundary, goal), then combining with the
-    intra-block APSP matrix D.
-    """
-    bb = oracle.base_blocks[br][bc]
-    chain = oracle.ancestor_chains.get((br, bc), [])
-
-    # Propagate goal distances backward (root → immediate parent) through
-    # the same expansion function — valid because D_global is symmetric.
-    reverse_d = _expand_through_hierarchy(list(reversed(chain)), goal_exp) if chain else goal_exp
-
-    # d(boundary_b, goal) for each of the 12 boundary cells
-    btg = np.empty(12, dtype=np.int64)
-    for b in range(12):
-        btg[b] = reverse_d.get(bb.boundary_cells[b], SENTINEL)
-
-    # d(cell, goal) = min_b( D[cell, boundary_b] + d(boundary_b, goal) )
-    D_to_b = bb.D[:, _BI].astype(np.int64)          # (16, 12)
-    sums = D_to_b + btg[np.newaxis, :]               # broadcast (16, 12)
-    np.clip(sums, 0, SENTINEL, out=sums)
-    dists = np.min(sums, axis=1)                      # (16,)
-
-    # Same block as goal: direct intra-block path may be shorter
-    gr, gc = goal
-    if gr // 4 == br and gc // 4 == bc:
-        g_local = (gr % 4) * 4 + (gc % 4)
-        dists = np.minimum(dists, bb.D[:, g_local].astype(np.int64))
-
-    return dists
-
-
-# ---------------------------------------------------------------------------
 # Path reconstruction
 # ---------------------------------------------------------------------------
 
@@ -259,13 +300,18 @@ def reconstruct_path(
     s: tuple[int, int],
     g: tuple[int, int],
     goal_exp: dict[tuple[int, int], int] | None = None,
+    block_dists: dict[tuple[int, int], np.ndarray] | None = None,
 ) -> list[tuple[int, int]]:
     if s == g:
         return [s]
 
-    if goal_exp is None:
-        goal_exp = precompute_goal_expansion(oracle, g)
-    d_sg = query_distance(oracle, s, g, goal_exp)
+    if block_dists is not None:
+        d_sg = query_distance(oracle, s, g, block_dists=block_dists)
+    else:
+        if goal_exp is None:
+            goal_exp = precompute_goal_expansion(oracle, g)
+        d_sg = query_distance(oracle, s, g, goal_exp)
+
     if d_sg >= SENTINEL:
         return []
 
@@ -273,33 +319,94 @@ def reconstruct_path(
     path = [s]
     current = s
 
-    # Cache d(cell, goal) for every cell in each base block we touch.
-    # One reverse expansion per block replaces ~8 full expansions per step.
-    block_cache: dict[tuple[int, int], np.ndarray] = {}
+    if block_dists is not None:
+        # Pure-lookup reconstruction: every d(neighbor, goal) is an array read
+        while current != g:
+            best_next = None
+            best_cost = SENTINEL
 
-    while current != g:
-        best_next = None
-        best_cost = SENTINEL
+            for nr, nc in grid.get_neighbors(current[0], current[1]):
+                w = grid.edge_weight(current[0], current[1], nr, nc)
+                if w >= SENTINEL:
+                    continue
 
-        for nr, nc in grid.get_neighbors(current[0], current[1]):
-            w = grid.edge_weight(current[0], current[1], nr, nc)
-            if w >= SENTINEL:
-                continue
+                bk = (nr // 4, nc // 4)
+                bd = block_dists.get(bk)
+                if bd is None:
+                    continue
+                d_ng = int(bd[(nr % 4) * 4 + (nc % 4)])
+                total = tropical_add(w, d_ng)
+                if total < best_cost:
+                    best_cost = total
+                    best_next = (nr, nc)
 
-            bk = (nr // 4, nc // 4)
-            if bk not in block_cache:
-                block_cache[bk] = _block_goal_dists(oracle, bk[0], bk[1], goal_exp, g)
+            if best_next is None:
+                break
+            path.append(best_next)
+            current = best_next
+    else:
+        # Legacy lazy-cache path (fallback when block_dists not provided)
+        if goal_exp is None:
+            goal_exp = precompute_goal_expansion(oracle, g)
 
-            d_ng = int(block_cache[bk][(nr % 4) * 4 + (nc % 4)])
-            total = tropical_add(w, d_ng)
-            if total < best_cost:
-                best_cost = total
-                best_next = (nr, nc)
+        block_cache: dict[tuple[int, int], np.ndarray] = {}
 
-        if best_next is None:
-            break
+        while current != g:
+            best_next = None
+            best_cost = SENTINEL
 
-        path.append(best_next)
-        current = best_next
+            for nr, nc in grid.get_neighbors(current[0], current[1]):
+                w = grid.edge_weight(current[0], current[1], nr, nc)
+                if w >= SENTINEL:
+                    continue
+
+                bk = (nr // 4, nc // 4)
+                if bk not in block_cache:
+                    block_cache[bk] = _block_goal_dists(oracle, bk[0], bk[1], goal_exp, g)
+
+                d_ng = int(block_cache[bk][(nr % 4) * 4 + (nc % 4)])
+                total = tropical_add(w, d_ng)
+                if total < best_cost:
+                    best_cost = total
+                    best_next = (nr, nc)
+
+            if best_next is None:
+                break
+            path.append(best_next)
+            current = best_next
 
     return path
+
+
+# ---------------------------------------------------------------------------
+# Legacy per-block reverse expansion (kept for fallback path)
+# ---------------------------------------------------------------------------
+
+def _block_goal_dists(
+    oracle: Oracle,
+    br: int,
+    bc: int,
+    goal_exp: dict[tuple[int, int], int],
+    goal: tuple[int, int],
+) -> np.ndarray:
+    """Return a 16-element int64 array: d(cell, goal) for every cell in block (br, bc)."""
+    bb = oracle.base_blocks[br][bc]
+    chain = oracle.ancestor_chains.get((br, bc), [])
+
+    reverse_d = _expand_through_hierarchy(list(reversed(chain)), goal_exp) if chain else goal_exp
+
+    btg = np.empty(12, dtype=np.int64)
+    for b in range(12):
+        btg[b] = reverse_d.get(bb.boundary_cells[b], SENTINEL)
+
+    D_to_b = bb.D[:, _BI].astype(np.int64)
+    sums = D_to_b + btg[np.newaxis, :]
+    np.clip(sums, 0, SENTINEL, out=sums)
+    dists = np.min(sums, axis=1)
+
+    gr, gc = goal
+    if gr // 4 == br and gc // 4 == bc:
+        g_local = (gr % 4) * 4 + (gc % 4)
+        dists = np.minimum(dists, bb.D[:, g_local].astype(np.int64))
+
+    return dists
