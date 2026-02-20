@@ -204,6 +204,53 @@ def query_distance(
 
 
 # ---------------------------------------------------------------------------
+# Block-level distance cache for fast reconstruction
+# ---------------------------------------------------------------------------
+
+_BI = np.array(BOUNDARY_INDICES, dtype=np.int32)
+
+
+def _block_goal_dists(
+    oracle: Oracle,
+    br: int,
+    bc: int,
+    goal_exp: dict[tuple[int, int], int],
+    goal: tuple[int, int],
+) -> np.ndarray:
+    """Return a 16-element int64 array: d(cell, goal) for every cell in block (br, bc).
+
+    Works by reverse-expanding goal_exp through the block's ancestor chain
+    (root → leaf) to obtain d(boundary, goal), then combining with the
+    intra-block APSP matrix D.
+    """
+    bb = oracle.base_blocks[br][bc]
+    chain = oracle.ancestor_chains.get((br, bc), [])
+
+    # Propagate goal distances backward (root → immediate parent) through
+    # the same expansion function — valid because D_global is symmetric.
+    reverse_d = _expand_through_hierarchy(list(reversed(chain)), goal_exp) if chain else goal_exp
+
+    # d(boundary_b, goal) for each of the 12 boundary cells
+    btg = np.empty(12, dtype=np.int64)
+    for b in range(12):
+        btg[b] = reverse_d.get(bb.boundary_cells[b], SENTINEL)
+
+    # d(cell, goal) = min_b( D[cell, boundary_b] + d(boundary_b, goal) )
+    D_to_b = bb.D[:, _BI].astype(np.int64)          # (16, 12)
+    sums = D_to_b + btg[np.newaxis, :]               # broadcast (16, 12)
+    np.clip(sums, 0, SENTINEL, out=sums)
+    dists = np.min(sums, axis=1)                      # (16,)
+
+    # Same block as goal: direct intra-block path may be shorter
+    gr, gc = goal
+    if gr // 4 == br and gc // 4 == bc:
+        g_local = (gr % 4) * 4 + (gc % 4)
+        dists = np.minimum(dists, bb.D[:, g_local].astype(np.int64))
+
+    return dists
+
+
+# ---------------------------------------------------------------------------
 # Path reconstruction
 # ---------------------------------------------------------------------------
 
@@ -211,11 +258,13 @@ def reconstruct_path(
     oracle: Oracle,
     s: tuple[int, int],
     g: tuple[int, int],
+    goal_exp: dict[tuple[int, int], int] | None = None,
 ) -> list[tuple[int, int]]:
     if s == g:
         return [s]
 
-    goal_exp = precompute_goal_expansion(oracle, g)
+    if goal_exp is None:
+        goal_exp = precompute_goal_expansion(oracle, g)
     d_sg = query_distance(oracle, s, g, goal_exp)
     if d_sg >= SENTINEL:
         return []
@@ -223,6 +272,10 @@ def reconstruct_path(
     grid = oracle.grid
     path = [s]
     current = s
+
+    # Cache d(cell, goal) for every cell in each base block we touch.
+    # One reverse expansion per block replaces ~8 full expansions per step.
+    block_cache: dict[tuple[int, int], np.ndarray] = {}
 
     while current != g:
         best_next = None
@@ -232,7 +285,12 @@ def reconstruct_path(
             w = grid.edge_weight(current[0], current[1], nr, nc)
             if w >= SENTINEL:
                 continue
-            d_ng = query_distance(oracle, (nr, nc), g, goal_exp)
+
+            bk = (nr // 4, nc // 4)
+            if bk not in block_cache:
+                block_cache[bk] = _block_goal_dists(oracle, bk[0], bk[1], goal_exp, g)
+
+            d_ng = int(block_cache[bk][(nr % 4) * 4 + (nc % 4)])
             total = tropical_add(w, d_ng)
             if total < best_cost:
                 best_cost = total
