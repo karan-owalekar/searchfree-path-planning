@@ -20,10 +20,12 @@ NEIGHBOR_OPTIONS = ["8", "4"]
 
 
 class App:
-    def __init__(self, compare: bool = False, use_gpu: bool = False):
+    def __init__(self, compare: bool = False, use_gpu: bool = False,
+                 optimize: str = "path"):
         pygame.init()
         self._compare = compare
         self._use_gpu = use_gpu
+        self._optimize = optimize
 
         info = pygame.display.Info()
         w = max(theme.WINDOW_MIN_W, int(info.current_w * 0.75))
@@ -205,7 +207,8 @@ class App:
             self._status.text = "Building oracle..."
             pygame.display.flip()
             t0 = time.perf_counter()
-            self._oracle = build_pathcircuit_oracle(self._grid)
+            self._oracle = build_pathcircuit_oracle(
+                self._grid, build_linked_list=(self._optimize == "path"))
             self._oracle_build_ms = (time.perf_counter() - t0) * 1000.0
             self._oracle_dirty = False
             print(f"\n  Oracle built in {self._oracle_build_ms:.2f} ms")

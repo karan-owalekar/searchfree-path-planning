@@ -17,7 +17,15 @@ def main():
         action="store_true",
         help="Use GPU (CUDA) for oracle reconstruction and comparison algorithms",
     )
+    parser.add_argument(
+        "--optimize",
+        choices=["oracle", "path"],
+        default="path",
+        help="Optimize for fast oracle build or fast path query (default: path)",
+    )
     args = parser.parse_args()
+
+    print(f"  Optimize: {args.optimize}", file=sys.stderr)
 
     if args.gpu:
         from pathcircuit.gpu import is_gpu_available
@@ -46,7 +54,8 @@ def main():
         print(f"  GPU kernels ready ({gpu_ms:.0f} ms)", file=sys.stderr)
 
     from pathcircuit.ui.app import App
-    app = App(compare=args.compare_algorithms, use_gpu=args.gpu)
+    app = App(compare=args.compare_algorithms, use_gpu=args.gpu,
+              optimize=args.optimize)
     app.run()
 
 

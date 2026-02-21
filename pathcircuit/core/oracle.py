@@ -546,6 +546,8 @@ def build_oracle(
     base_blocks: list[list[BaseBlock]],
     N: int,
     grid: Grid,
+    *,
+    build_linked_list: bool = True,
 ) -> Oracle:
     blocks_r = len(base_blocks)
     blocks_c = len(base_blocks[0])
@@ -585,10 +587,12 @@ def build_oracle(
 
     costs_flat = grid.costs.ravel().astype(np.int64)
 
-    atlas, successor, boundary_coords, boundary_local_bi = \
-        _build_linked_list_structures(
-            base_blocks, blocks_r, blocks_c, N, grid,
-            block_bids, boundary_dist)
+    atlas = successor = boundary_coords = boundary_local_bi = None
+    if build_linked_list:
+        atlas, successor, boundary_coords, boundary_local_bi = \
+            _build_linked_list_structures(
+                base_blocks, blocks_r, blocks_c, N, grid,
+                block_bids, boundary_dist)
 
     return Oracle(
         base_blocks=base_blocks, N=N, grid=grid,

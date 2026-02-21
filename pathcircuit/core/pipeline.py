@@ -10,8 +10,14 @@ from pathcircuit.core.uncondense import un_condense_all
 from pathcircuit.core.oracle import Oracle, build_oracle
 
 
-def build_pathcircuit_oracle(grid: Grid) -> Oracle:
-    """Full pipeline: pad grid -> base blocks -> hierarchy -> un-condense -> oracle."""
+def build_pathcircuit_oracle(grid: Grid, *, build_linked_list: bool = True) -> Oracle:
+    """Full pipeline: pad grid -> base blocks -> hierarchy -> un-condense -> oracle.
+
+    Args:
+        build_linked_list: If True, build atlas + successor table for ~2μs path
+            retrieval. If False, skip them for faster oracle build (path
+            reconstruction falls back to inline greedy walk).
+    """
     padded = grid.to_padded()
     N = padded.rows  # square after padding
 
@@ -30,12 +36,14 @@ def build_pathcircuit_oracle(grid: Grid) -> Oracle:
         bb.D_global = bb.T.copy()
         bb.D_global_cells = list(bb.boundary_cells)
         bb.D_global_cell_to_index = dict(bb.boundary_cell_to_index)
-        return _build_single_block_oracle(bb, base_blocks, N, padded)
+        return _build_single_block_oracle(bb, base_blocks, N, padded,
+                                          build_linked_list=build_linked_list)
 
     root, all_nodes = build_hierarchy(base_blocks, N, padded)
     un_condense_all(root, N)
 
-    return build_oracle(root, base_blocks, N, padded)
+    return build_oracle(root, base_blocks, N, padded,
+                        build_linked_list=build_linked_list)
 
 
 def _build_single_block_oracle(
@@ -43,10 +51,10 @@ def _build_single_block_oracle(
     base_blocks: list[list[BaseBlock]],
     N: int,
     grid: Grid,
+    *,
+    build_linked_list: bool = True,
 ) -> Oracle:
     """Trivial oracle for a single 4x4 base block (no hierarchy)."""
-    from pathcircuit.core.oracle import _build_linked_list_structures
-
     all_D = bb.D[np.newaxis, :, :].astype(np.int32)
 
     boundary_dist = np.full((12, 12), SENTINEL, dtype=np.int32)
@@ -55,12 +63,14 @@ def _build_single_block_oracle(
                    out=boundary_dist)
 
     block_bids = np.arange(12, dtype=np.int32).reshape(1, 1, 12)
-
     costs_flat = grid.costs.ravel().astype(np.int64)
 
-    atlas, successor, boundary_coords, boundary_local_bi = \
-        _build_linked_list_structures(base_blocks, 1, 1, N, grid,
-                                      block_bids, boundary_dist)
+    atlas = successor = boundary_coords = boundary_local_bi = None
+    if build_linked_list:
+        from pathcircuit.core.oracle import _build_linked_list_structures
+        atlas, successor, boundary_coords, boundary_local_bi = \
+            _build_linked_list_structures(base_blocks, 1, 1, N, grid,
+                                          block_bids, boundary_dist)
 
     return Oracle(
         base_blocks=base_blocks, N=N, grid=grid,
