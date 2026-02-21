@@ -8,7 +8,6 @@ from pathcircuit.grid import Grid, SENTINEL
 from pathcircuit.core.pipeline import build_pathcircuit_oracle
 from pathcircuit.core.oracle import (
     Oracle, query_distance, reconstruct_path,
-    precompute_goal_expansion, precompute_all_block_dists,
 )
 from pathcircuit.compare.runner import run_comparison
 from pathcircuit.ui import theme
@@ -211,11 +210,14 @@ class App:
             print(f"\n  Oracle built in {self._oracle_build_ms:.2f} ms")
 
         t0 = time.perf_counter()
-        goal_exp = precompute_goal_expansion(self._oracle, goal)
-        block_dists = precompute_all_block_dists(self._oracle, goal_exp, goal)
-        dist = query_distance(self._oracle, start, goal, block_dists=block_dists)
-        path = reconstruct_path(self._oracle, start, goal, block_dists=block_dists)
-        query_ms = (time.perf_counter() - t0) * 1000.0
+        dist = query_distance(self._oracle, start, goal)
+        dist_ms = (time.perf_counter() - t0) * 1000.0
+
+        t1 = time.perf_counter()
+        path = reconstruct_path(self._oracle, start, goal)
+        recon_ms = (time.perf_counter() - t1) * 1000.0
+
+        query_ms = dist_ms + recon_ms
 
         if dist >= SENTINEL:
             self._grid_view.path = []
@@ -224,12 +226,12 @@ class App:
         else:
             self._grid_view.path = path
             self._status.text = f"Path found \u2014 cost: {dist}  length: {len(path)} cells  ({query_ms:.2f} ms)"
-            print(f"  Query: cost={dist}  length={len(path)}  ({query_ms:.2f} ms)")
+            print(f"  Query: cost={dist}  length={len(path)}  (dist={dist_ms:.3f} ms  recon={recon_ms:.3f} ms)")
 
         if self._compare:
             run_comparison(
                 self._grid, start, goal,
-                self._oracle_build_ms, query_ms,
+                self._oracle_build_ms, dist_ms, recon_ms,
                 path, dist,
             )
 

@@ -27,7 +27,8 @@ def run_comparison(
     start: tuple[int, int],
     goal: tuple[int, int],
     oracle_build_ms: float,
-    oracle_query_ms: float,
+    oracle_dist_ms: float,
+    oracle_recon_ms: float,
     oracle_path: list[tuple[int, int]],
     oracle_cost: int,
 ) -> None:
@@ -52,9 +53,12 @@ def run_comparison(
 
     cost_str = str(oracle_cost) if oracle_cost < SENTINEL else "unreachable"
     path_len = str(len(oracle_path)) + " cells" if oracle_path else "N/A"
+    query_ms = oracle_dist_ms + oracle_recon_ms
     print(_box("Search-Free Planner", [
         ("Oracle Build", f"{oracle_build_ms:.2f} ms"),
-        ("Path Query", f"{oracle_query_ms:.2f} ms"),
+        ("Distance Query", f"{oracle_dist_ms:.3f} ms"),
+        ("Path Reconstruction", f"{oracle_recon_ms:.3f} ms"),
+        ("Total Query", f"{query_ms:.3f} ms"),
         ("Path Cost", cost_str),
         ("Path Length", path_len),
     ]))

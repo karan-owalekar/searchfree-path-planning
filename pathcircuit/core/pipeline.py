@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import numpy as np
+
 from pathcircuit.grid import Grid
+from pathcircuit.core.tropical import SENTINEL
 from pathcircuit.core.base_block import BaseBlock, compute_base_block
 from pathcircuit.core.hierarchy import build_hierarchy
 from pathcircuit.core.uncondense import un_condense_all
@@ -42,8 +45,19 @@ def _build_single_block_oracle(
     grid: Grid,
 ) -> Oracle:
     """Trivial oracle for a single 4x4 base block (no hierarchy)."""
+    all_D = bb.D[np.newaxis, :, :].astype(np.int32)
+
+    boundary_dist = np.full((12, 12), SENTINEL, dtype=np.int32)
+    if bb.D_global is not None:
+        np.minimum(boundary_dist, bb.D_global[:12, :12].astype(np.int32),
+                   out=boundary_dist)
+
+    block_bids = np.arange(12, dtype=np.int32).reshape(1, 1, 12)
+
+    costs_flat = grid.costs.ravel().astype(np.int64)
+
     return Oracle(
-        base_blocks=base_blocks,
-        N=N,
-        grid=grid,
+        base_blocks=base_blocks, N=N, grid=grid,
+        all_D=all_D, boundary_dist=boundary_dist, block_bids=block_bids,
+        costs_flat=costs_flat,
     )
