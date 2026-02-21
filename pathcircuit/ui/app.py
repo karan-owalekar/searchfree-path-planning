@@ -208,25 +208,24 @@ class App:
             pygame.display.flip()
             t0 = time.perf_counter()
             self._oracle = build_pathcircuit_oracle(
-                self._grid, build_linked_list=(self._optimize == "path"))
+                self._grid,
+                build_linked_list=(self._optimize == "path"),
+                use_gpu=self._use_gpu)
             self._oracle_build_ms = (time.perf_counter() - t0) * 1000.0
             self._oracle_dirty = False
             print(f"\n  Oracle built in {self._oracle_build_ms:.2f} ms")
 
-        if self._use_gpu:
+        use_gpu_recon = self._use_gpu and self._optimize != "path"
+
+        t0 = time.perf_counter()
+        dist = query_distance(self._oracle, start, goal)
+        dist_ms = (time.perf_counter() - t0) * 1000.0
+
+        if use_gpu_recon:
             from pathcircuit.gpu.oracle_gpu import gpu_reconstruct_path
-
-            t0 = time.perf_counter()
-            dist = query_distance(self._oracle, start, goal)
-            dist_ms = (time.perf_counter() - t0) * 1000.0
-
             gpu_ms, path = gpu_reconstruct_path(self._oracle, start, goal)
             recon_ms = gpu_ms
         else:
-            t0 = time.perf_counter()
-            dist = query_distance(self._oracle, start, goal)
-            dist_ms = (time.perf_counter() - t0) * 1000.0
-
             t1 = time.perf_counter()
             path = reconstruct_path(self._oracle, start, goal)
             recon_ms = (time.perf_counter() - t1) * 1000.0
@@ -239,7 +238,7 @@ class App:
             print(f"  Query: unreachable  ({query_ms:.2f} ms)")
         else:
             self._grid_view.path = path
-            mode = " [GPU]" if self._use_gpu else ""
+            mode = " [GPU]" if use_gpu_recon else ""
             self._status.text = f"Path found \u2014 cost: {dist}  length: {len(path)} cells  ({query_ms:.2f} ms){mode}"
             print(f"  Query: cost={dist}  length={len(path)}  (dist={dist_ms:.3f} ms  recon={recon_ms:.3f} ms){mode}")
 
@@ -249,6 +248,7 @@ class App:
                 self._oracle_build_ms, dist_ms, recon_ms,
                 path, dist,
                 use_gpu=self._use_gpu,
+                gpu_recon=use_gpu_recon,
             )
 
     # ---- rendering ----

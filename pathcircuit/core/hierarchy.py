@@ -14,6 +14,12 @@ from pathcircuit.core.tropical import (
 from pathcircuit.core.base_block import BaseBlock
 from pathcircuit.grid import Grid
 
+try:
+    from numba import njit as _njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
 BlockLike = Union[BaseBlock, "MergeNode"]
 
 
@@ -152,6 +158,142 @@ def _identify_vertical_partition(A: BlockLike, B: BlockLike):
 # Joint matrix assembly
 # ---------------------------------------------------------------------------
 
+if _HAS_NUMBA:
+    @_njit(cache=True, nogil=True)
+    def _assemble_jit(  # type: ignore[misc]
+        T_A, T_B,
+        e_source, e_idx, e_rows, e_cols,
+        s_a_map, s_b_map,
+        ia_rows, ia_cols, ib_rows, ib_cols,
+        costs_flat, N, connectivity,
+    ):
+        SEN = np.int32(536_870_912)
+        nE = e_source.shape[0]
+        nSA = s_a_map.shape[0]
+        nSB = s_b_map.shape[0]
+        nS = nSA + nSB
+        n = nE + nS
+        M = np.full((n, n), SEN, dtype=np.int32)
+
+        for i in range(nE):
+            si = e_source[i]
+            idx_i = e_idx[i]
+            ri = e_rows[i]
+            ci = e_cols[i]
+            for j in range(nE):
+                sj = e_source[j]
+                idx_j = e_idx[j]
+                if si == sj:
+                    if si == 0:
+                        M[i, j] = T_A[idx_i, idx_j]
+                    else:
+                        M[i, j] = T_B[idx_i, idx_j]
+                else:
+                    rj = e_rows[j]
+                    cj = e_cols[j]
+                    dr = ri - rj if ri >= rj else rj - ri
+                    dc = ci - cj if ci >= cj else cj - ci
+                    adj = False
+                    if connectivity == 4:
+                        adj = (dr + dc) == 1
+                    else:
+                        mx = dr if dr > dc else dc
+                        adj = mx == 1 and (dr + dc) > 0
+                    if adj:
+                        wi = costs_flat[ri * N + ci]
+                        wj = costs_flat[rj * N + cj]
+                        if wi < SEN and wj < SEN:
+                            M[i, j] = wi + wj
+
+        for i in range(nE):
+            si = e_source[i]
+            idx_i = e_idx[i]
+            ri = e_rows[i]
+            ci = e_cols[i]
+            for j in range(nS):
+                sj_idx = nE + j
+                if j < nSA:
+                    if si == 0:
+                        val = T_A[idx_i, s_a_map[j]]
+                        M[i, sj_idx] = val
+                        M[sj_idx, i] = val
+                    else:
+                        rj = ia_rows[j]
+                        cj = ia_cols[j]
+                        dr = ri - rj if ri >= rj else rj - ri
+                        dc = ci - cj if ci >= cj else cj - ci
+                        if connectivity == 4:
+                            adj = (dr + dc) == 1
+                        else:
+                            mx = dr if dr > dc else dc
+                            adj = mx == 1 and (dr + dc) > 0
+                        if adj:
+                            wi = costs_flat[ri * N + ci]
+                            wj = costs_flat[rj * N + cj]
+                            if wi < SEN and wj < SEN:
+                                w = wi + wj
+                                if w < M[i, sj_idx]:
+                                    M[i, sj_idx] = w
+                                    M[sj_idx, i] = w
+                else:
+                    jB = j - nSA
+                    if si == 1:
+                        val = T_B[idx_i, s_b_map[jB]]
+                        M[i, sj_idx] = val
+                        M[sj_idx, i] = val
+                    else:
+                        rj = ib_rows[jB]
+                        cj = ib_cols[jB]
+                        dr = ri - rj if ri >= rj else rj - ri
+                        dc = ci - cj if ci >= cj else cj - ci
+                        if connectivity == 4:
+                            adj = (dr + dc) == 1
+                        else:
+                            mx = dr if dr > dc else dc
+                            adj = mx == 1 and (dr + dc) > 0
+                        if adj:
+                            wi = costs_flat[ri * N + ci]
+                            wj = costs_flat[rj * N + cj]
+                            if wi < SEN and wj < SEN:
+                                w = wi + wj
+                                if w < M[i, sj_idx]:
+                                    M[i, sj_idx] = w
+                                    M[sj_idx, i] = w
+
+        for i in range(nS):
+            for j in range(nS):
+                si_idx = nE + i
+                sj_idx = nE + j
+                inA_i = i < nSA
+                inA_j = j < nSA
+                if inA_i and inA_j:
+                    M[si_idx, sj_idx] = T_A[s_a_map[i], s_a_map[j]]
+                elif (not inA_i) and (not inA_j):
+                    M[si_idx, sj_idx] = T_B[s_b_map[i - nSA], s_b_map[j - nSA]]
+                else:
+                    if inA_i:
+                        ri, ci_c = ia_rows[i], ia_cols[i]
+                        rj, cj = ib_rows[j - nSA], ib_cols[j - nSA]
+                    else:
+                        ri, ci_c = ia_rows[j], ia_cols[j]
+                        rj, cj = ib_rows[i - nSA], ib_cols[i - nSA]
+                    dr = ri - rj if ri >= rj else rj - ri
+                    dc = ci_c - cj if ci_c >= cj else cj - ci_c
+                    if connectivity == 4:
+                        adj = (dr + dc) == 1
+                    else:
+                        mx = dr if dr > dc else dc
+                        adj = mx == 1 and (dr + dc) > 0
+                    if adj:
+                        wi = costs_flat[ri * N + ci_c]
+                        wj = costs_flat[rj * N + cj]
+                        if wi < SEN and wj < SEN:
+                            w = wi + wj
+                            M[si_idx, sj_idx] = w
+                            M[sj_idx, si_idx] = w
+        return M
+
+
 def _assemble_joint_matrix(
     T_A: np.ndarray,
     T_B: np.ndarray,
@@ -164,10 +306,39 @@ def _assemble_joint_matrix(
     grid: Grid,
 ) -> np.ndarray:
     nE = len(C_boundary)
+
+    if _HAS_NUMBA:
+        e_source = np.empty(nE, dtype=np.int8)
+        e_idx = np.empty(nE, dtype=np.int32)
+        e_rows = np.empty(nE, dtype=np.int32)
+        e_cols = np.empty(nE, dtype=np.int32)
+        for i, cell in enumerate(C_boundary):
+            if cell in A.boundary_cell_to_index:
+                e_source[i] = 0
+                e_idx[i] = A.boundary_cell_to_index[cell]
+            else:
+                e_source[i] = 1
+                e_idx[i] = B.boundary_cell_to_index[cell]
+            e_rows[i] = cell[0]
+            e_cols[i] = cell[1]
+
+        s_a_map = np.array([A.boundary_cell_to_index[c] for c in I_A], dtype=np.int32) if I_A else np.empty(0, dtype=np.int32)
+        s_b_map = np.array([B.boundary_cell_to_index[c] for c in I_B], dtype=np.int32) if I_B else np.empty(0, dtype=np.int32)
+        ia_rows = np.array([c[0] for c in I_A], dtype=np.int32) if I_A else np.empty(0, dtype=np.int32)
+        ia_cols = np.array([c[1] for c in I_A], dtype=np.int32) if I_A else np.empty(0, dtype=np.int32)
+        ib_rows = np.array([c[0] for c in I_B], dtype=np.int32) if I_B else np.empty(0, dtype=np.int32)
+        ib_cols = np.array([c[1] for c in I_B], dtype=np.int32) if I_B else np.empty(0, dtype=np.int32)
+
+        costs_flat = grid.costs.ravel()
+        return _assemble_jit(
+            T_A, T_B, e_source, e_idx, e_rows, e_cols,
+            s_a_map, s_b_map, ia_rows, ia_cols, ib_rows, ib_cols,
+            costs_flat, np.int32(grid.rows), np.int32(grid.connectivity),
+        )
+
     nS = len(S)
     n = nE + nS
 
-    # Build source mappings for E cells
     E_map: list[tuple[str, int]] = []
     for cell in C_boundary:
         if cell in A.boundary_cell_to_index:
@@ -183,7 +354,6 @@ def _assemble_joint_matrix(
 
     M = np.full((n, n), SENTINEL, dtype=np.int32)
 
-    # M_EE
     for i in range(nE):
         for j in range(nE):
             si, idx_i = E_map[i]
@@ -194,13 +364,11 @@ def _assemble_joint_matrix(
             elif are_grid_adjacent(C_boundary[i], C_boundary[j], grid.connectivity):
                 M[i, j] = _edge_weight(C_boundary[i], C_boundary[j], grid)
 
-    # M_ES / M_SE
     for i in range(nE):
         si, idx_i = E_map[i]
         for j in range(nS):
             sj_idx = nE + j
             if j < nSA:
-                # S cell from I_A
                 if si == "A":
                     val = int(T_A[idx_i, S_A_map[j]])
                     M[i, sj_idx] = val
@@ -211,7 +379,6 @@ def _assemble_joint_matrix(
                         M[i, sj_idx] = w
                         M[sj_idx, i] = w
             else:
-                # S cell from I_B
                 jB = j - nSA
                 if si == "B":
                     val = int(T_B[idx_i, S_B_map[jB]])
@@ -223,7 +390,6 @@ def _assemble_joint_matrix(
                         M[i, sj_idx] = w
                         M[sj_idx, i] = w
 
-    # M_SS
     for i in range(nS):
         for j in range(nS):
             si = nE + i

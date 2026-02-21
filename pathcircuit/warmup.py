@@ -18,9 +18,16 @@ def warmup_jit() -> None:
     for conn in (4, 8):
         g = Grid(8, 8, connectivity=conn)
         g.set_obstacle(3, 3)
-        o = build_pathcircuit_oracle(g)
+
+        # Warm up linked-list path (--optimize path)
+        o = build_pathcircuit_oracle(g, build_linked_list=True)
         query_distance(o, (1, 1), (6, 6))
         reconstruct_path(o, (1, 1), (6, 6))
+
+        # Warm up inline greedy path (--optimize oracle)
+        o_fast = build_pathcircuit_oracle(g, build_linked_list=False)
+        reconstruct_path(o_fast, (1, 1), (6, 6))
+
         dijkstra(g, (1, 1), (6, 6))
         astar(g, (1, 1), (6, 6))
 
@@ -35,6 +42,6 @@ def warmup_gpu() -> None:
     for conn in (4, 8):
         g = Grid(8, 8, connectivity=conn)
         g.set_obstacle(3, 3)
-        o = build_pathcircuit_oracle(g)
+        o = build_pathcircuit_oracle(g, use_gpu=True)
         gpu_reconstruct_path(o, (1, 1), (6, 6))
         gpu_dijkstra(g, (1, 1), (6, 6))

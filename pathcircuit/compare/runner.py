@@ -32,10 +32,11 @@ def run_comparison(
     oracle_path: list[tuple[int, int]],
     oracle_cost: int,
     use_gpu: bool = False,
+    gpu_recon: bool = False,
 ) -> None:
     """Run Dijkstra and A*, then print a formatted comparison to stdout."""
     obstacle_count = int((grid.costs >= SENTINEL).sum())
-    mode_tag = " (GPU)" if use_gpu else ""
+    mode_tag = " (GPU)" if gpu_recon else ""
 
     print()
     print("  " + "=" * (BOX_WIDTH - 2))

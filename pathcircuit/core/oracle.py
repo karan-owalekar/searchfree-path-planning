@@ -185,36 +185,77 @@ if _HAS_NUMBA:
                         best = val
                 d_arr[ck] = best
 
+    @_njit(cache=True)
+    def _jit_expand_indexed(d_arr, D_flat, D_offsets, cell_flat,  # type: ignore[misc]
+                            cell_offsets, sizes, indices):
+        """Like _jit_expand but only processes specific node indices."""
+        _S = np.int64(536_870_912)
+        for ii in range(indices.shape[0]):
+            ni = indices[ii]
+            n = np.int64(sizes[ni])
+            if n == 0:
+                continue
+            co = cell_offsets[ni]
+            do = D_offsets[ni]
+
+            n_br = np.int64(0)
+            bi = np.empty(n, dtype=np.int64)
+            bd = np.empty(n, dtype=np.int64)
+            for i in range(n):
+                cv = d_arr[cell_flat[co + i]]
+                if cv < _S:
+                    bi[n_br] = i
+                    bd[n_br] = cv
+                    n_br += 1
+
+            if n_br == 0:
+                continue
+
+            for k in range(n):
+                ck = cell_flat[co + k]
+                best = d_arr[ck]
+                for b in range(n_br):
+                    dg = np.int64(D_flat[do + bi[b] * n + k])
+                    if dg >= _S:
+                        continue
+                    val = bd[b] + dg
+                    if val < best:
+                        best = val
+                d_arr[ck] = best
+
     @_njit(cache=True, nogil=True)
     def _process_block_boundary(  # type: ignore[misc]
         D_block, base_bid, N, boundary_flat, n_boundary, BI,
-        chain_D, chain_Do, chain_cf, chain_co, chain_sz, chain_n,
-        tree_D, tree_Do, tree_cf, tree_co, tree_sz, tree_n,
-        out,
+        tree_D, tree_Do, tree_cf, tree_co, tree_sz,
+        chain_idx, remaining_idx,
+        out, d_buf,
     ):
         """Process all 12 boundary cells of one block. Writes to out[12, n_boundary].
 
-        nogil=True releases the GIL so multiple blocks run in parallel threads.
+        d_buf is a pre-allocated int64[N*N] scratch buffer (reused across
+        the 12 boundary cells to avoid repeated allocation).
         """
         _S = np.int64(536_870_912)
+        nn = N * N
         for b in range(12):
-            d_arr = np.full(N * N, _S, dtype=np.int64)
+            for i in range(nn):
+                d_buf[i] = _S
 
             src_local = BI[b]
             for j in range(12):
                 d_ij = np.int64(D_block[src_local, BI[j]])
                 if d_ij < _S:
-                    d_arr[boundary_flat[base_bid + j]] = d_ij
+                    d_buf[boundary_flat[base_bid + j]] = d_ij
 
-            if chain_n > 0:
-                _jit_expand(d_arr, chain_D, chain_Do, chain_cf,
-                            chain_co, chain_sz, chain_n)
-            if tree_n > 0:
-                _jit_expand(d_arr, tree_D, tree_Do, tree_cf,
-                            tree_co, tree_sz, tree_n)
+            if chain_idx.shape[0] > 0:
+                _jit_expand_indexed(d_buf, tree_D, tree_Do, tree_cf,
+                                    tree_co, tree_sz, chain_idx)
+            if remaining_idx.shape[0] > 0:
+                _jit_expand_indexed(d_buf, tree_D, tree_Do, tree_cf,
+                                    tree_co, tree_sz, remaining_idx)
 
             for bid2 in range(n_boundary):
-                d = d_arr[boundary_flat[bid2]]
+                d = d_buf[boundary_flat[bid2]]
                 if d < _S:
                     out[b, bid2] = np.int32(d)
 
@@ -231,13 +272,12 @@ def _build_boundary_table(
     boundary_flat: np.ndarray,
     n_boundary: int,
     tree_data: tuple,
-    chain_data: dict[tuple[int, int], tuple],
+    chain_indices: dict[tuple[int, int], np.ndarray],
+    remaining_indices: dict[tuple[int, int], np.ndarray],
 ) -> np.ndarray:
     """Build the all-pairs boundary distance table.
 
-    Dispatches blocks to parallel threads; each block's 12 boundary cells
-    are expanded through the hierarchy independently.
-
+    Uses index arrays into tree_data instead of separate per-chain copies.
     Returns int32[n_boundary, n_boundary].
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -246,8 +286,7 @@ def _build_boundary_table(
     boundary_dist = np.full((n_boundary, n_boundary), SENTINEL, dtype=np.int32)
     tree_D, tree_Do, tree_cf, tree_co, tree_sz, tree_n = tree_data
 
-    empty_i32 = np.empty(0, dtype=np.int32)
-    empty_i64 = np.empty(0, dtype=np.int64)
+    empty_idx = np.empty(0, dtype=np.int32)
 
     tasks: list[tuple] = []
     for br in range(blocks_r):
@@ -257,28 +296,27 @@ def _build_boundary_table(
             D_block = base_blocks[br][bc].D
 
             g_key = (br, bc)
-            if g_key in chain_data:
-                cD, cDo, ccf, cco, csz, cn = chain_data[g_key]
-            else:
-                cD, cDo, ccf, cco, csz, cn = empty_i32, empty_i64, empty_i64, empty_i64, empty_i32, 0
+            ci = chain_indices.get(g_key, empty_idx)
+            ri = remaining_indices.get(g_key, empty_idx)
 
             out = np.full((12, n_boundary), SENTINEL, dtype=np.int32)
-            tasks.append((D_block, base_bid, cD, cDo, ccf, cco, csz, cn, out))
+            tasks.append((D_block, base_bid, ci, ri, out))
 
     n_blocks = len(tasks)
+    nn = N * N
 
     if _HAS_NUMBA and n_blocks >= 4:
         n_workers = min(os.cpu_count() or 4, n_blocks)
+        d_bufs = [np.empty(nn, dtype=np.int64) for _ in range(n_blocks)]
+
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {}
-            for args in tasks:
-                D_block, base_bid, cD, cDo, ccf, cco, csz, cn, out = args
+            for i, (D_block, base_bid, ci, ri, out) in enumerate(tasks):
                 fut = pool.submit(
                     _process_block_boundary,
                     D_block, base_bid, N, boundary_flat, n_boundary, _BI,
-                    cD, cDo, ccf, cco, csz, cn,
-                    tree_D, tree_Do, tree_cf, tree_co, tree_sz, tree_n,
-                    out,
+                    tree_D, tree_Do, tree_cf, tree_co, tree_sz,
+                    ci, ri, out, d_bufs[i],
                 )
                 futures[fut] = (base_bid, out)
 
@@ -288,18 +326,17 @@ def _build_boundary_table(
                 boundary_dist[base_bid:base_bid + 12] = np.minimum(
                     boundary_dist[base_bid:base_bid + 12], out)
     else:
-        for args in tasks:
-            D_block, base_bid, cD, cDo, ccf, cco, csz, cn, out = args
+        d_buf = np.empty(nn, dtype=np.int64)
+        for D_block, base_bid, ci, ri, out in tasks:
             if _HAS_NUMBA:
                 _process_block_boundary(
                     D_block, base_bid, N, boundary_flat, n_boundary, _BI,
-                    cD, cDo, ccf, cco, csz, cn,
-                    tree_D, tree_Do, tree_cf, tree_co, tree_sz, tree_n,
-                    out,
+                    tree_D, tree_Do, tree_cf, tree_co, tree_sz,
+                    ci, ri, out, d_buf,
                 )
             else:
                 for b in range(12):
-                    d_arr = np.full(N * N, SENTINEL, dtype=np.int64)
+                    d_arr = np.full(nn, SENTINEL, dtype=np.int64)
                     src_local = BOUNDARY_INDICES[b]
                     for j in range(12):
                         d_ij = int(D_block[src_local, BOUNDARY_INDICES[j]])
@@ -318,11 +355,70 @@ def _build_boundary_table(
 # LINKED-LIST BUILD: atlas, adjacency, successor
 # ===================================================================
 
-def _build_atlas(base_blocks, blocks_r, blocks_c, connectivity):
-    """Build intra-block path atlas: int8[blocks_r, blocks_c, 12, 12, 9]."""
+if _HAS_NUMBA:
+    @_njit(cache=True)
+    def _build_atlas_jit(all_D, blocks_r, blocks_c, BI, NBRS):  # type: ignore[misc]
+        """Build intra-block path atlas: int8[blocks_r, blocks_c, 12, 12, 9]."""
+        _S = np.int32(536_870_912)
+        atlas = np.zeros((blocks_r, blocks_c, 12, 12, 9), dtype=np.int8)
+        path_buf = np.empty(16, dtype=np.int8)
+
+        for br in range(blocks_r):
+            for bc in range(blocks_c):
+                D = all_D[br * blocks_c + bc]
+                for ei in range(12):
+                    e_local = BI[ei]
+                    for xi in range(12):
+                        x_local = BI[xi]
+                        if ei == xi:
+                            atlas[br, bc, ei, xi, 0] = 1
+                            atlas[br, bc, ei, xi, 1] = np.int8(e_local)
+                            continue
+                        if D[e_local, x_local] >= _S:
+                            continue
+                        path_buf[0] = np.int8(e_local)
+                        plen = np.int32(1)
+                        cur = e_local
+                        for _ in range(16):
+                            if cur == x_local:
+                                break
+                            best_n = np.int32(-1)
+                            best_cost = np.int64(_S)
+                            for k in range(8):
+                                n = NBRS[cur, k]
+                                if n < 0:
+                                    break
+                                w = np.int64(D[cur, n])
+                                if w >= _S:
+                                    continue
+                                rem = np.int64(D[n, x_local])
+                                if rem >= _S:
+                                    continue
+                                total = w + rem
+                                if total < best_cost:
+                                    best_cost = total
+                                    best_n = n
+                            if best_n < 0:
+                                break
+                            path_buf[plen] = np.int8(best_n)
+                            plen += 1
+                            cur = best_n
+                        if cur == x_local:
+                            out_len = min(plen, np.int32(8))
+                            atlas[br, bc, ei, xi, 0] = np.int8(out_len)
+                            for k in range(out_len):
+                                atlas[br, bc, ei, xi, k + 1] = path_buf[k]
+        return atlas
+
+
+def _build_atlas(base_blocks, blocks_r, blocks_c, connectivity, all_D=None):
+    """Build intra-block path atlas."""
+    if _HAS_NUMBA and all_D is not None:
+        NBRS = _NBRS_8 if connectivity == 8 else _NBRS_4
+        return _build_atlas_jit(all_D, blocks_r, blocks_c, _BI, NBRS)
+
     nbrs_map = NEIGHBORS_8 if connectivity == 8 else NEIGHBORS_4
     atlas = np.zeros((blocks_r, blocks_c, 12, 12, 9), dtype=np.int8)
-
     for br in range(blocks_r):
         for bc in range(blocks_c):
             bb = base_blocks[br][bc]
@@ -344,20 +440,13 @@ def _build_atlas(base_blocks, blocks_r, blocks_c, connectivity):
                             break
                         best_n, best_c = -1, SENTINEL
                         for n in nbrs_map[cur]:
-                            w = int(D[cur, n]) - int(D[n, n])
+                            w = int(D[cur, n])
                             if w >= SENTINEL:
-                                w_raw = int(D[cur, cur]) + int(D[n, n])
-                                if w_raw >= SENTINEL:
-                                    continue
-                                rem = int(D[n, x_local])
-                                if rem >= SENTINEL:
-                                    continue
-                                total = w_raw + rem
-                            else:
-                                rem = int(D[n, x_local])
-                                if rem >= SENTINEL:
-                                    continue
-                                total = w + rem
+                                continue
+                            rem = int(D[n, x_local])
+                            if rem >= SENTINEL:
+                                continue
+                            total = w + rem
                             if total < best_c:
                                 best_c = total
                                 best_n = n
@@ -373,9 +462,147 @@ def _build_atlas(base_blocks, blocks_r, blocks_c, connectivity):
     return atlas
 
 
+if _HAS_NUMBA:
+    @_njit(cache=True)
+    def _build_adjacency_jit(all_T, boundary_cells_flat, costs_flat,  # type: ignore[misc]
+                             blocks_r, blocks_c, N, connectivity,
+                             BI, LOCAL_TO_BI_arr):
+        """Build boundary adjacency as flat CSR arrays.
+
+        all_T: int32[n_blocks, 12, 12] — transfer matrices stacked.
+        boundary_cells_flat: int32[n_blocks*12, 2] — (row, col) per boundary cell.
+        """
+        _S = np.int32(536_870_912)
+        n_bnd = blocks_r * blocks_c * 12
+        MAX_EDGES_PER_CELL = 24  # 11 intra + up to 8 cross
+        tmp_nbrs = np.empty((n_bnd, MAX_EDGES_PER_CELL), dtype=np.int32)
+        tmp_costs = np.empty((n_bnd, MAX_EDGES_PER_CELL), dtype=np.int32)
+        tmp_count = np.zeros(n_bnd, dtype=np.int32)
+
+        if connectivity == 8:
+            dr_arr = np.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=np.int32)
+            dc_arr = np.array([-1, 0, 1, -1, 1, -1, 0, 1], dtype=np.int32)
+        else:
+            dr_arr = np.array([-1, 0, 0, 1], dtype=np.int32)
+            dc_arr = np.array([0, -1, 1, 0], dtype=np.int32)
+        n_dirs = len(dr_arr)
+
+        for block_idx in range(blocks_r * blocks_c):
+            base_bid = block_idx * 12
+            br = block_idx // blocks_c
+            bc = block_idx % blocks_c
+
+            # Intra-block edges via T matrix
+            for ai in range(12):
+                a_bid = base_bid + ai
+                for bi in range(12):
+                    if bi == ai:
+                        continue
+                    cost = all_T[block_idx, ai, bi]
+                    if cost >= _S:
+                        continue
+                    c = tmp_count[a_bid]
+                    if c < MAX_EDGES_PER_CELL:
+                        tmp_nbrs[a_bid, c] = base_bid + bi
+                        tmp_costs[a_bid, c] = cost
+                        tmp_count[a_bid] = c + 1
+
+            # Cross-block edges
+            for ai in range(12):
+                a_bid = base_bid + ai
+                ar = boundary_cells_flat[a_bid, 0]
+                ac = boundary_cells_flat[a_bid, 1]
+                for d in range(n_dirs):
+                    nr = ar + dr_arr[d]
+                    nc = ac + dc_arr[d]
+                    if nr < 0 or nr >= N or nc < 0 or nc >= N:
+                        continue
+                    n_br = nr // 4
+                    n_bc = nc // 4
+                    if n_br == br and n_bc == bc:
+                        continue
+                    n_local = (nr % 4) * 4 + (nc % 4)
+                    n_bi = LOCAL_TO_BI_arr[n_local]
+                    if n_bi < 0:
+                        continue
+                    n_bid = (n_br * blocks_c + n_bc) * 12 + n_bi
+                    ci = costs_flat[ar * N + ac]
+                    cj = costs_flat[nr * N + nc]
+                    if ci >= _S or cj >= _S:
+                        continue
+                    c = tmp_count[a_bid]
+                    if c < MAX_EDGES_PER_CELL:
+                        tmp_nbrs[a_bid, c] = n_bid
+                        tmp_costs[a_bid, c] = np.int32(ci + cj)
+                        tmp_count[a_bid] = c + 1
+
+        # Deduplicate: keep min cost per neighbor (in-place)
+        dedup_nbrs = np.empty((n_bnd, MAX_EDGES_PER_CELL), dtype=np.int32)
+        dedup_costs = np.empty((n_bnd, MAX_EDGES_PER_CELL), dtype=np.int32)
+        dedup_count = np.zeros(n_bnd, dtype=np.int32)
+
+        for a in range(n_bnd):
+            cnt = tmp_count[a]
+            dc = np.int32(0)
+            for i in range(cnt):
+                nbr = tmp_nbrs[a, i]
+                cost = tmp_costs[a, i]
+                found = False
+                for j in range(dc):
+                    if dedup_nbrs[a, j] == nbr:
+                        if cost < dedup_costs[a, j]:
+                            dedup_costs[a, j] = cost
+                        found = True
+                        break
+                if not found:
+                    dedup_nbrs[a, dc] = nbr
+                    dedup_costs[a, dc] = cost
+                    dc += 1
+            dedup_count[a] = dc
+
+        # Flatten to CSR
+        total = np.int32(0)
+        for a in range(n_bnd):
+            total += dedup_count[a]
+
+        adj_nbrs = np.empty(total, dtype=np.int32)
+        adj_costs_out = np.empty(total, dtype=np.int32)
+        adj_offsets = np.empty(n_bnd + 1, dtype=np.int32)
+        idx = np.int32(0)
+        for a in range(n_bnd):
+            adj_offsets[a] = idx
+            for i in range(dedup_count[a]):
+                adj_nbrs[idx] = dedup_nbrs[a, i]
+                adj_costs_out[idx] = dedup_costs[a, i]
+                idx += 1
+        adj_offsets[n_bnd] = idx
+
+        return adj_nbrs, adj_costs_out, adj_offsets
+
+
 def _build_adjacency_flat(base_blocks, blocks_r, blocks_c, N, grid,
-                          block_bids, boundary_dist):
+                          block_bids, boundary_dist, all_D=None):
     """Build boundary adjacency in flat CSR arrays for JIT."""
+    if _HAS_NUMBA:
+        n_blocks = blocks_r * blocks_c
+        all_T = np.empty((n_blocks, 12, 12), dtype=np.int32)
+        boundary_cells_flat = np.empty((n_blocks * 12, 2), dtype=np.int32)
+        for br in range(blocks_r):
+            for bc in range(blocks_c):
+                bb = base_blocks[br][bc]
+                idx = br * blocks_c + bc
+                all_T[idx] = bb.T
+                for bi in range(12):
+                    r, c = bb.boundary_cells[bi]
+                    boundary_cells_flat[idx * 12 + bi, 0] = r
+                    boundary_cells_flat[idx * 12 + bi, 1] = c
+
+        costs = grid.costs.ravel().astype(np.int32)
+        return _build_adjacency_jit(
+            all_T, boundary_cells_flat, costs,
+            blocks_r, blocks_c, N, grid.connectivity,
+            _BI, _LOCAL_TO_BI)
+
     _S = SENTINEL
     n_bnd = blocks_r * blocks_c * 12
     connectivity = grid.connectivity
@@ -388,7 +615,6 @@ def _build_adjacency_flat(base_blocks, blocks_r, blocks_c, N, grid,
             base_bid = (br * blocks_c + bc) * 12
             for ai in range(12):
                 a_bid = base_bid + ai
-                # Intra-block: other boundary cells via T matrix
                 for bi in range(12):
                     if bi == ai:
                         continue
@@ -398,7 +624,6 @@ def _build_adjacency_flat(base_blocks, blocks_r, blocks_c, N, grid,
                     b_bid = base_bid + bi
                     adj[a_bid].append((b_bid, cost))
 
-    # Cross-block edges
     for br in range(blocks_r):
         for bc in range(blocks_c):
             bb = base_blocks[br][bc]
@@ -428,7 +653,6 @@ def _build_adjacency_flat(base_blocks, blocks_r, blocks_c, N, grid,
                         continue
                     adj[a_bid].append((n_bid, ci + cj))
 
-    # Deduplicate: keep min cost per neighbor
     for a in range(n_bnd):
         best: dict[int, int] = {}
         for nbr, cost in adj[a]:
@@ -436,7 +660,6 @@ def _build_adjacency_flat(base_blocks, blocks_r, blocks_c, N, grid,
                 best[nbr] = cost
         adj[a] = list(best.items())
 
-    # Flatten to CSR
     total_edges = sum(len(a) for a in adj)
     adj_nbrs = np.empty(total_edges, dtype=np.int32)
     adj_costs = np.empty(total_edges, dtype=np.int32)
@@ -486,12 +709,14 @@ if _HAS_NUMBA:
 
 
 def _build_linked_list_structures(base_blocks, blocks_r, blocks_c, N, grid,
-                                  block_bids, boundary_dist):
+                                  block_bids, boundary_dist, all_D=None):
     """Build atlas + adjacency + successor table."""
-    atlas = _build_atlas(base_blocks, blocks_r, blocks_c, grid.connectivity)
+    atlas = _build_atlas(base_blocks, blocks_r, blocks_c, grid.connectivity,
+                         all_D=all_D)
 
     adj_nbrs, adj_costs, adj_offsets = _build_adjacency_flat(
-        base_blocks, blocks_r, blocks_c, N, grid, block_bids, boundary_dist)
+        base_blocks, blocks_r, blocks_c, N, grid, block_bids, boundary_dist,
+        all_D=all_D)
 
     B = blocks_r * blocks_c * 12
     if _HAS_NUMBA:
@@ -548,6 +773,7 @@ def build_oracle(
     grid: Grid,
     *,
     build_linked_list: bool = True,
+    use_gpu: bool = False,
 ) -> Oracle:
     blocks_r = len(base_blocks)
     blocks_c = len(base_blocks[0])
@@ -570,15 +796,36 @@ def build_oracle(
 
     if isinstance(root, MergeNode):
         dfs_nodes = _collect_dfs_order(root)
+        valid_nodes = [n for n in dfs_nodes if n.D_global_cells is not None]
         tree_data = _linearize_nodes(dfs_nodes, N)
+        tree_n = tree_data[5]
+
+        node_to_valid_idx = {id(n): i for i, n in enumerate(valid_nodes)}
+        all_idx_set = set(range(tree_n))
 
         chains = _build_ancestor_chains(root)
-        chain_data = {k: _linearize_nodes(v, N) for k, v in chains.items()}
+        chain_indices: dict[tuple[int, int], np.ndarray] = {}
+        remaining_indices: dict[tuple[int, int], np.ndarray] = {}
+        for key, chain_nodes in chains.items():
+            ci = [node_to_valid_idx[id(n)] for n in chain_nodes
+                  if id(n) in node_to_valid_idx]
+            chain_indices[key] = np.array(ci, dtype=np.int32)
+            ri = sorted(all_idx_set - set(ci))
+            remaining_indices[key] = np.array(ri, dtype=np.int32)
 
-        boundary_dist = _build_boundary_table(
-            base_blocks, blocks_r, blocks_c, N,
-            boundary_flat, n_boundary, tree_data, chain_data,
-        )
+        if use_gpu:
+            from pathcircuit.gpu.boundary_gpu import gpu_build_boundary_table
+            boundary_dist = gpu_build_boundary_table(
+                all_D, boundary_flat, tree_data,
+                chain_indices, remaining_indices,
+                blocks_r, blocks_c, N,
+            )
+        else:
+            boundary_dist = _build_boundary_table(
+                base_blocks, blocks_r, blocks_c, N,
+                boundary_flat, n_boundary, tree_data,
+                chain_indices, remaining_indices,
+            )
     else:
         bb = base_blocks[0][0]
         boundary_dist = np.full((12, 12), SENTINEL, dtype=np.int32)
@@ -592,7 +839,7 @@ def build_oracle(
         atlas, successor, boundary_coords, boundary_local_bi = \
             _build_linked_list_structures(
                 base_blocks, blocks_r, blocks_c, N, grid,
-                block_bids, boundary_dist)
+                block_bids, boundary_dist, all_D=all_D)
 
     return Oracle(
         base_blocks=base_blocks, N=N, grid=grid,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from pathcircuit.grid import Grid
@@ -10,13 +13,19 @@ from pathcircuit.core.uncondense import un_condense_all
 from pathcircuit.core.oracle import Oracle, build_oracle
 
 
-def build_pathcircuit_oracle(grid: Grid, *, build_linked_list: bool = True) -> Oracle:
+def build_pathcircuit_oracle(
+    grid: Grid,
+    *,
+    build_linked_list: bool = True,
+    use_gpu: bool = False,
+) -> Oracle:
     """Full pipeline: pad grid -> base blocks -> hierarchy -> un-condense -> oracle.
 
     Args:
         build_linked_list: If True, build atlas + successor table for ~2μs path
             retrieval. If False, skip them for faster oracle build (path
             reconstruction falls back to inline greedy walk).
+        use_gpu: If True, build boundary table on GPU via CUDA.
     """
     padded = grid.to_padded()
     N = padded.rows  # square after padding
@@ -24,11 +33,35 @@ def build_pathcircuit_oracle(grid: Grid, *, build_linked_list: bool = True) -> O
     blocks_r = N // 4
     blocks_c = N // 4
 
+    n_blocks = blocks_r * blocks_c
+    flat_blocks: list[BaseBlock | None] = [None] * n_blocks
+
+    import numpy as _np
+    costs_flat = padded.costs.ravel().astype(_np.int32)
+
+    if n_blocks >= 64:
+        n_workers = min(os.cpu_count() or 4, n_blocks)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {}
+            for br in range(blocks_r):
+                for bc in range(blocks_c):
+                    fut = pool.submit(compute_base_block, br, bc, padded,
+                                      _costs_flat=costs_flat)
+                    futures[fut] = (br, bc)
+            for fut in futures:
+                br, bc = futures[fut]
+                flat_blocks[br * blocks_c + bc] = fut.result()
+    else:
+        for br in range(blocks_r):
+            for bc in range(blocks_c):
+                flat_blocks[br * blocks_c + bc] = compute_base_block(
+                    br, bc, padded, _costs_flat=costs_flat)
+
     base_blocks: list[list[BaseBlock]] = []
     for br in range(blocks_r):
         row: list[BaseBlock] = []
         for bc in range(blocks_c):
-            row.append(compute_base_block(br, bc, padded))
+            row.append(flat_blocks[br * blocks_c + bc])  # type: ignore[arg-type]
         base_blocks.append(row)
 
     if N == 4:
@@ -43,7 +76,8 @@ def build_pathcircuit_oracle(grid: Grid, *, build_linked_list: bool = True) -> O
     un_condense_all(root, N)
 
     return build_oracle(root, base_blocks, N, padded,
-                        build_linked_list=build_linked_list)
+                        build_linked_list=build_linked_list,
+                        use_gpu=use_gpu)
 
 
 def _build_single_block_oracle(

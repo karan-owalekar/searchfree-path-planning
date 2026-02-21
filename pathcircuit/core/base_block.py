@@ -10,6 +10,12 @@ from pathcircuit.core.tropical import (
 )
 from pathcircuit.grid import Grid
 
+try:
+    from numba import njit as _njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
 # -- 4x4 block layout constants --
 
 BOUNDARY_INDICES = [0, 1, 2, 3, 4, 7, 8, 11, 12, 13, 14, 15]
@@ -46,6 +52,40 @@ for _cell in range(16):
             _nbrs.append(_nr * 4 + _nc)
     NEIGHBORS_8[_cell] = _nbrs
 
+# Flat numpy neighbor arrays for JIT
+_NBRS_4_BB = np.full((16, 8), -1, dtype=np.int32)
+_NBRS_8_BB = np.full((16, 8), -1, dtype=np.int32)
+for _c in range(16):
+    for _j, _n in enumerate(NEIGHBORS_4[_c]):
+        _NBRS_4_BB[_c, _j] = _n
+    for _j, _n in enumerate(NEIGHBORS_8[_c]):
+        _NBRS_8_BB[_c, _j] = _n
+
+_BI_BB = np.array(BOUNDARY_INDICES, dtype=np.int32)
+
+if _HAS_NUMBA:
+    @_njit(cache=True, nogil=True)
+    def _build_weight_matrix_jit(br, bc, costs, N, NBRS):  # type: ignore[misc]
+        _S = np.int32(536_870_912)
+        W = np.full((16, 16), _S, dtype=np.int32)
+        for i in range(16):
+            W[i, i] = 0
+            ri = br * 4 + i // 4
+            ci = bc * 4 + i % 4
+            cost_i = costs[ri * N + ci]
+            for k in range(8):
+                j = NBRS[i, k]
+                if j < 0:
+                    break
+                rj = br * 4 + j // 4
+                cj = bc * 4 + j % 4
+                cost_j = costs[rj * N + cj]
+                if cost_i >= _S or cost_j >= _S:
+                    W[i, j] = _S
+                else:
+                    W[i, j] = cost_i + cost_j
+        return W
+
 
 @dataclass
 class BaseBlock:
@@ -67,34 +107,36 @@ class BaseBlock:
     D_global_cell_to_index: dict[tuple[int, int], int] | None = field(default=None, repr=False)
 
 
-def build_weight_matrix(br: int, bc: int, grid: Grid) -> np.ndarray:
+def build_weight_matrix(br: int, bc: int, grid: Grid,
+                        _costs_flat: np.ndarray | None = None) -> np.ndarray:
     """Build the 16x16 weighted adjacency matrix for a 4x4 base block."""
+    if _HAS_NUMBA:
+        NBRS = _NBRS_8_BB if grid.connectivity == 8 else _NBRS_4_BB
+        costs = _costs_flat if _costs_flat is not None else grid.costs.ravel().astype(np.int32)
+        return _build_weight_matrix_jit(br, bc, costs, grid.cols, NBRS)
+
     W = np.full((16, 16), SENTINEL, dtype=np.int32)
-
     neighbors = NEIGHBORS_8 if grid.connectivity == 8 else NEIGHBORS_4
-
     for i in range(16):
         W[i, i] = 0
         ri = br * 4 + i // 4
         ci = bc * 4 + i % 4
         cost_i = int(grid.costs[ri, ci])
-
         for j in neighbors[i]:
             rj = br * 4 + j // 4
             cj = bc * 4 + j % 4
             cost_j = int(grid.costs[rj, cj])
-
             if cost_i >= SENTINEL or cost_j >= SENTINEL:
                 W[i, j] = SENTINEL
             else:
                 W[i, j] = cost_i + cost_j
-
     return W
 
 
-def compute_base_block(br: int, bc: int, grid: Grid) -> BaseBlock:
+def compute_base_block(br: int, bc: int, grid: Grid,
+                       _costs_flat: np.ndarray | None = None) -> BaseBlock:
     """Compute the base block at grid position (br, bc)."""
-    W = build_weight_matrix(br, bc, grid)
+    W = build_weight_matrix(br, bc, grid, _costs_flat=_costs_flat)
 
     S1, w1 = tropical_matmul_with_witness(W, W)
     S2, w2 = tropical_matmul_with_witness(S1, S1)

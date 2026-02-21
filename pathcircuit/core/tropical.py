@@ -29,7 +29,7 @@ def tropical_min(a: int, b: int) -> int:
 # ---------------------------------------------------------------------------
 
 if _HAS_NUMBA:
-    @_njit(cache=True)
+    @_njit(cache=True, nogil=True)
     def _matmul_jit(A: np.ndarray, B: np.ndarray) -> np.ndarray:  # type: ignore[misc]
         _S = np.int64(536_870_912)
         n, m = A.shape
@@ -51,7 +51,7 @@ if _HAS_NUMBA:
                 C[i, j] = np.int32(best)
         return C
 
-    @_njit(cache=True)
+    @_njit(cache=True, nogil=True)
     def _matmul_witness_jit(A: np.ndarray, B: np.ndarray) -> tuple:  # type: ignore[misc]
         _S = np.int64(536_870_912)
         n, m = A.shape
@@ -77,7 +77,7 @@ if _HAS_NUMBA:
                 W[i, j] = best_k
         return C, W
 
-    @_njit(cache=True)
+    @_njit(cache=True, nogil=True)
     def minplus_mv(D_global: np.ndarray, bridge_idx: np.ndarray,  # type: ignore[misc]
                    bridge_d: np.ndarray, n_cells: int) -> np.ndarray:
         """d_new[k] = min_b( bridge_d[b] + D_global[bridge_idx[b], k] )"""
