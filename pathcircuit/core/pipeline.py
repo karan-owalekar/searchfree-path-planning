@@ -45,6 +45,8 @@ def _build_single_block_oracle(
     grid: Grid,
 ) -> Oracle:
     """Trivial oracle for a single 4x4 base block (no hierarchy)."""
+    from pathcircuit.core.oracle import _build_linked_list_structures
+
     all_D = bb.D[np.newaxis, :, :].astype(np.int32)
 
     boundary_dist = np.full((12, 12), SENTINEL, dtype=np.int32)
@@ -56,8 +58,16 @@ def _build_single_block_oracle(
 
     costs_flat = grid.costs.ravel().astype(np.int64)
 
+    atlas, successor, boundary_coords, boundary_local_bi = \
+        _build_linked_list_structures(base_blocks, 1, 1, N, grid,
+                                      block_bids, boundary_dist)
+
     return Oracle(
         base_blocks=base_blocks, N=N, grid=grid,
         all_D=all_D, boundary_dist=boundary_dist, block_bids=block_bids,
         costs_flat=costs_flat,
+        atlas=atlas,
+        boundary_successor=successor,
+        boundary_coords=boundary_coords,
+        boundary_local_bi=boundary_local_bi,
     )

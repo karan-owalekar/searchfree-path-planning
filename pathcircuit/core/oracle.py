@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from pathcircuit.core.tropical import SENTINEL, tropical_add
-from pathcircuit.core.base_block import BaseBlock, BOUNDARY_INDICES
+from pathcircuit.core.base_block import (
+    BaseBlock, BOUNDARY_INDICES, LOCAL_TO_BOUNDARY,
+    NEIGHBORS_4, NEIGHBORS_8,
+)
 from pathcircuit.core.hierarchy import MergeNode, BlockLike
 from pathcircuit.grid import Grid
 
@@ -16,6 +19,18 @@ except ImportError:
     _HAS_NUMBA = False
 
 _BI = np.array(BOUNDARY_INDICES, dtype=np.int32)
+
+_NBRS_4 = np.full((16, 8), -1, dtype=np.int32)
+_NBRS_8 = np.full((16, 8), -1, dtype=np.int32)
+for _c in range(16):
+    for _j, _n in enumerate(NEIGHBORS_4[_c]):
+        _NBRS_4[_c, _j] = _n
+    for _j, _n in enumerate(NEIGHBORS_8[_c]):
+        _NBRS_8[_c, _j] = _n
+
+_LOCAL_TO_BI = np.full(16, -1, dtype=np.int32)
+for _local, _bi in LOCAL_TO_BOUNDARY.items():
+    _LOCAL_TO_BI[_local] = _bi
 
 
 @dataclass
@@ -38,6 +53,23 @@ class Oracle:
 
     # Pre-flattened costs array for JIT kernels: int64[rows*cols]
     costs_flat: np.ndarray = field(repr=False)
+
+    # --- Linked-list path retrieval structures ---
+
+    # Intra-block path atlas: int8[n_blocks_r, n_blocks_c, 12, 12, 9]
+    # atlas[br,bc,entry_bi,exit_bi,0] = path_length
+    # atlas[br,bc,entry_bi,exit_bi,1..length] = local cell indices
+    atlas: np.ndarray | None = field(default=None, repr=False)
+
+    # Boundary successor table: int32[B, B]  (target-major)
+    # successor[target_bid, current_bid] = next boundary ID toward target
+    boundary_successor: np.ndarray | None = field(default=None, repr=False)
+
+    # Boundary coord lookup: int32[B, 2]  (row, col)
+    boundary_coords: np.ndarray | None = field(default=None, repr=False)
+
+    # Per-boundary-cell local boundary index: int8[B]
+    boundary_local_bi: np.ndarray | None = field(default=None, repr=False)
 
 
 # ===================================================================
@@ -283,6 +315,229 @@ def _build_boundary_table(
 
 
 # ===================================================================
+# LINKED-LIST BUILD: atlas, adjacency, successor
+# ===================================================================
+
+def _build_atlas(base_blocks, blocks_r, blocks_c, connectivity):
+    """Build intra-block path atlas: int8[blocks_r, blocks_c, 12, 12, 9]."""
+    nbrs_map = NEIGHBORS_8 if connectivity == 8 else NEIGHBORS_4
+    atlas = np.zeros((blocks_r, blocks_c, 12, 12, 9), dtype=np.int8)
+
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            bb = base_blocks[br][bc]
+            D = bb.D
+            for ei in range(12):
+                e_local = BOUNDARY_INDICES[ei]
+                for xi in range(12):
+                    x_local = BOUNDARY_INDICES[xi]
+                    if ei == xi:
+                        atlas[br, bc, ei, xi, 0] = 1
+                        atlas[br, bc, ei, xi, 1] = e_local
+                        continue
+                    if int(D[e_local, x_local]) >= SENTINEL:
+                        continue
+                    path = [e_local]
+                    cur = e_local
+                    for _ in range(16):
+                        if cur == x_local:
+                            break
+                        best_n, best_c = -1, SENTINEL
+                        for n in nbrs_map[cur]:
+                            w = int(D[cur, n]) - int(D[n, n])
+                            if w >= SENTINEL:
+                                w_raw = int(D[cur, cur]) + int(D[n, n])
+                                if w_raw >= SENTINEL:
+                                    continue
+                                rem = int(D[n, x_local])
+                                if rem >= SENTINEL:
+                                    continue
+                                total = w_raw + rem
+                            else:
+                                rem = int(D[n, x_local])
+                                if rem >= SENTINEL:
+                                    continue
+                                total = w + rem
+                            if total < best_c:
+                                best_c = total
+                                best_n = n
+                        if best_n < 0:
+                            break
+                        path.append(best_n)
+                        cur = best_n
+                    if cur == x_local:
+                        plen = min(len(path), 8)
+                        atlas[br, bc, ei, xi, 0] = plen
+                        for k in range(plen):
+                            atlas[br, bc, ei, xi, k + 1] = path[k]
+    return atlas
+
+
+def _build_adjacency_flat(base_blocks, blocks_r, blocks_c, N, grid,
+                          block_bids, boundary_dist):
+    """Build boundary adjacency in flat CSR arrays for JIT."""
+    _S = SENTINEL
+    n_bnd = blocks_r * blocks_c * 12
+    connectivity = grid.connectivity
+
+    adj: list[list[tuple[int, int]]] = [[] for _ in range(n_bnd)]
+
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            bb = base_blocks[br][bc]
+            base_bid = (br * blocks_c + bc) * 12
+            for ai in range(12):
+                a_bid = base_bid + ai
+                # Intra-block: other boundary cells via T matrix
+                for bi in range(12):
+                    if bi == ai:
+                        continue
+                    cost = int(bb.T[ai, bi])
+                    if cost >= _S:
+                        continue
+                    b_bid = base_bid + bi
+                    adj[a_bid].append((b_bid, cost))
+
+    # Cross-block edges
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            bb = base_blocks[br][bc]
+            base_bid = (br * blocks_c + bc) * 12
+            for ai in range(12):
+                a_bid = base_bid + ai
+                ar, ac = bb.boundary_cells[ai]
+                if connectivity == 8:
+                    offsets = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+                else:
+                    offsets = [(-1,0),(0,-1),(0,1),(1,0)]
+                for dr, dc in offsets:
+                    nr, nc = ar + dr, ac + dc
+                    if nr < 0 or nr >= N or nc < 0 or nc >= N:
+                        continue
+                    n_br, n_bc = nr // 4, nc // 4
+                    if n_br == br and n_bc == bc:
+                        continue
+                    n_local = (nr % 4) * 4 + (nc % 4)
+                    n_bi = LOCAL_TO_BOUNDARY.get(n_local, -1)
+                    if n_bi < 0:
+                        continue
+                    n_bid = (n_br * blocks_c + n_bc) * 12 + n_bi
+                    ci = int(grid.costs[ar, ac])
+                    cj = int(grid.costs[nr, nc])
+                    if ci >= _S or cj >= _S:
+                        continue
+                    adj[a_bid].append((n_bid, ci + cj))
+
+    # Deduplicate: keep min cost per neighbor
+    for a in range(n_bnd):
+        best: dict[int, int] = {}
+        for nbr, cost in adj[a]:
+            if nbr not in best or cost < best[nbr]:
+                best[nbr] = cost
+        adj[a] = list(best.items())
+
+    # Flatten to CSR
+    total_edges = sum(len(a) for a in adj)
+    adj_nbrs = np.empty(total_edges, dtype=np.int32)
+    adj_costs = np.empty(total_edges, dtype=np.int32)
+    adj_offsets = np.empty(n_bnd + 1, dtype=np.int32)
+    idx = 0
+    for a in range(n_bnd):
+        adj_offsets[a] = idx
+        for nbr, cost in adj[a]:
+            adj_nbrs[idx] = nbr
+            adj_costs[idx] = cost
+            idx += 1
+    adj_offsets[n_bnd] = idx
+
+    return adj_nbrs, adj_costs, adj_offsets
+
+
+if _HAS_NUMBA:
+    @_njit(cache=True, parallel=True)
+    def _build_successor_jit(boundary_dist, adj_nbrs, adj_costs, adj_offsets, B):  # type: ignore[misc]
+        """Build B×B successor table. successor[target, current] = next hop."""
+        _S = np.int32(536_870_912)
+        successor = np.full((B, B), np.int32(-1), dtype=np.int32)
+        for target in _prange(B):
+            for current in range(B):
+                if current == target:
+                    successor[target, current] = target
+                    continue
+                d_ct = boundary_dist[current, target]
+                if d_ct >= _S:
+                    continue
+                best_next = np.int32(-1)
+                best_cost = np.int64(_S)
+                start = adj_offsets[current]
+                end = adj_offsets[current + 1]
+                for idx in range(start, end):
+                    nbr = adj_nbrs[idx]
+                    ec = np.int64(adj_costs[idx])
+                    d_nt = np.int64(boundary_dist[nbr, target])
+                    if d_nt >= _S:
+                        continue
+                    total = ec + d_nt
+                    if total < best_cost or (total == best_cost and nbr < best_next):
+                        best_cost = total
+                        best_next = nbr
+                successor[target, current] = best_next
+        return successor
+
+
+def _build_linked_list_structures(base_blocks, blocks_r, blocks_c, N, grid,
+                                  block_bids, boundary_dist):
+    """Build atlas + adjacency + successor table."""
+    atlas = _build_atlas(base_blocks, blocks_r, blocks_c, grid.connectivity)
+
+    adj_nbrs, adj_costs, adj_offsets = _build_adjacency_flat(
+        base_blocks, blocks_r, blocks_c, N, grid, block_bids, boundary_dist)
+
+    B = blocks_r * blocks_c * 12
+    if _HAS_NUMBA:
+        successor = _build_successor_jit(boundary_dist, adj_nbrs, adj_costs,
+                                         adj_offsets, B)
+    else:
+        successor = np.full((B, B), -1, dtype=np.int32)
+        _S = SENTINEL
+        for target in range(B):
+            for current in range(B):
+                if current == target:
+                    successor[target, current] = current
+                    continue
+                d_ct = int(boundary_dist[current, target])
+                if d_ct >= _S:
+                    continue
+                best_next, best_cost = -1, _S
+                for idx in range(adj_offsets[current], adj_offsets[current + 1]):
+                    nbr = int(adj_nbrs[idx])
+                    ec = int(adj_costs[idx])
+                    d_nt = int(boundary_dist[nbr, target])
+                    if d_nt >= _S:
+                        continue
+                    total = ec + d_nt
+                    if total < best_cost or (total == best_cost and nbr < best_next):
+                        best_cost = total
+                        best_next = nbr
+                successor[target, current] = best_next
+
+    # Boundary coordinate lookup
+    boundary_coords = np.empty((B, 2), dtype=np.int32)
+    boundary_local_bi = np.empty(B, dtype=np.int8)
+    for br in range(blocks_r):
+        for bc in range(blocks_c):
+            bb = base_blocks[br][bc]
+            base_bid = (br * blocks_c + bc) * 12
+            for bi in range(12):
+                bid = base_bid + bi
+                r, c = bb.boundary_cells[bi]
+                boundary_coords[bid] = (r, c)
+                boundary_local_bi[bid] = bi
+
+    return atlas, successor, boundary_coords, boundary_local_bi
+
+
+# ===================================================================
 # ORACLE CONSTRUCTION
 # ===================================================================
 
@@ -330,10 +585,19 @@ def build_oracle(
 
     costs_flat = grid.costs.ravel().astype(np.int64)
 
+    atlas, successor, boundary_coords, boundary_local_bi = \
+        _build_linked_list_structures(
+            base_blocks, blocks_r, blocks_c, N, grid,
+            block_bids, boundary_dist)
+
     return Oracle(
         base_blocks=base_blocks, N=N, grid=grid,
         all_D=all_D, boundary_dist=boundary_dist, block_bids=block_bids,
         costs_flat=costs_flat,
+        atlas=atlas,
+        boundary_successor=successor,
+        boundary_coords=boundary_coords,
+        boundary_local_bi=boundary_local_bi,
     )
 
 
@@ -713,6 +977,190 @@ if _HAS_NUMBA:
 
 
 # ===================================================================
+# LINKED-LIST PATH RETRIEVAL (JIT)
+# ===================================================================
+
+if _HAS_NUMBA:
+    @_njit(cache=True)
+    def _walk_within_block(s_local, g_local, br, bc, D_block,  # type: ignore[misc]
+                           costs_flat, N, NBRS, path_r, path_c, offset):
+        """Greedy walk inside a 16-cell block using exact D matrix. Returns new offset."""
+        _S = np.int64(536_870_912)
+        blocks_c = N // 4
+        cur = s_local
+        path_r[offset] = np.int32(br * 4 + cur // 4)
+        path_c[offset] = np.int32(bc * 4 + cur % 4)
+        off = offset + 1
+        for _ in range(16):
+            if cur == g_local:
+                break
+            best_n = np.int32(-1)
+            best_cost = _S
+            for k in range(8):
+                n = NBRS[cur, k]
+                if n < 0:
+                    break
+                cr = br * 4 + cur // 4
+                cc = bc * 4 + cur % 4
+                nr = br * 4 + n // 4
+                nc = bc * 4 + n % 4
+                ci = costs_flat[cr * N + cc]
+                cj = costs_flat[nr * N + nc]
+                if ci >= _S or cj >= _S:
+                    continue
+                w = ci + cj
+                rem = np.int64(D_block[n, g_local])
+                if rem >= _S:
+                    continue
+                total = w + rem
+                if total < best_cost:
+                    best_cost = total
+                    best_n = n
+            if best_n < 0:
+                break
+            path_r[off] = np.int32(br * 4 + best_n // 4)
+            path_c[off] = np.int32(bc * 4 + best_n % 4)
+            off += 1
+            cur = best_n
+        return off
+
+    @_njit(cache=True)
+    def _jit_retrieve_linked(costs_flat, N, connectivity,  # type: ignore[misc]
+                                sr, sc, gr, gc,
+                                all_D, boundary_dist, block_bids,
+                                BI, NBRS, LOCAL_TO_BI,
+                                atlas, boundary_successor,
+                                boundary_coords, boundary_local_bi):
+        """Linked-list path retrieval: gateway + successor pointers + atlas."""
+        _S = np.int64(536_870_912)
+        blocks_c = N // 4
+        max_len = N * N
+        path_r = np.empty(max_len, dtype=np.int32)
+        path_c = np.empty(max_len, dtype=np.int32)
+
+        s_br = sr // 4
+        s_bc = sc // 4
+        g_br = gr // 4
+        g_bc = gc // 4
+        s_local = (sr % 4) * 4 + (sc % 4)
+        g_local = (gr % 4) * 4 + (gc % 4)
+
+        D_s = all_D[s_br * blocks_c + s_bc]
+        D_g = all_D[g_br * blocks_c + g_bc]
+
+        if s_br == g_br and s_bc == g_bc:
+            off = _walk_within_block(s_local, g_local, s_br, s_bc,
+                                     D_s, costs_flat, N, NBRS,
+                                     path_r, path_c, 0)
+            return path_r[:off], path_c[:off]
+
+        # Gateway selection
+        best_dist = _S
+        best_a = np.int32(-1)
+        best_b = np.int32(-1)
+        best_a_bid = np.int32(-1)
+        best_b_bid = np.int32(-1)
+        s_base_bid = (s_br * blocks_c + s_bc) * 12
+        g_base_bid = (g_br * blocks_c + g_bc) * 12
+
+        for a in range(12):
+            d_sa = np.int64(D_s[s_local, BI[a]])
+            if d_sa >= _S:
+                continue
+            a_bid = s_base_bid + a
+            for b in range(12):
+                d_bg = np.int64(D_g[BI[b], g_local])
+                if d_bg >= _S:
+                    continue
+                b_bid = g_base_bid + b
+                d_mid = np.int64(boundary_dist[a_bid, b_bid])
+                if d_mid >= _S:
+                    continue
+                total = d_sa + d_mid + d_bg
+                if total < best_dist:
+                    best_dist = total
+                    best_a = a
+                    best_b = b
+                    best_a_bid = a_bid
+                    best_b_bid = b_bid
+
+        if best_dist >= _S:
+            return path_r[:0], path_c[:0]
+
+        a_cell_local = BI[best_a]
+        b_cell_local = BI[best_b]
+        off = np.int32(0)
+
+        # First mile: s → a*
+        if s_local != a_cell_local:
+            off = _walk_within_block(s_local, a_cell_local, s_br, s_bc,
+                                     D_s, costs_flat, N, NBRS,
+                                     path_r, path_c, 0)
+        else:
+            path_r[0] = np.int32(sr)
+            path_c[0] = np.int32(sc)
+            off = np.int32(1)
+
+        # Highway: a* → b* via successor pointers
+        # off currently points past a* (last cell of first mile)
+        # We need to avoid double-appending a*. The first mile already ends on a*.
+        # Start the highway from a*, but skip re-appending a* since it's already there.
+        current = best_a_bid
+
+        for _safety in range(max_len):
+            if current == best_b_bid:
+                break
+
+            nxt = boundary_successor[best_b_bid, current]
+            if nxt < 0:
+                break
+
+            cr = boundary_coords[current, 0]
+            cc = boundary_coords[current, 1]
+            cur_br = cr // 4
+            cur_bc = cc // 4
+            nxt_r = boundary_coords[nxt, 0]
+            nxt_c = boundary_coords[nxt, 1]
+            nxt_br = nxt_r // 4
+            nxt_bc = nxt_c // 4
+
+            if cur_br == nxt_br and cur_bc == nxt_bc:
+                cur_bi = boundary_local_bi[current]
+                nxt_bi = boundary_local_bi[nxt]
+                seg = atlas[cur_br, cur_bc, cur_bi, nxt_bi]
+                seg_len = seg[0]
+                # Append cells after current (index 1..seg_len-1 → local cells seg[2..seg_len])
+                for i in range(1, seg_len):
+                    local_cell = seg[i + 1]
+                    path_r[off] = np.int32(cur_br * 4 + local_cell // 4)
+                    path_c[off] = np.int32(cur_bc * 4 + local_cell % 4)
+                    off += 1
+            else:
+                # Cross-block: just append the next boundary cell
+                path_r[off] = nxt_r
+                path_c[off] = nxt_c
+                off += 1
+
+            current = nxt
+
+        # Last mile: b* → g
+        if b_cell_local != g_local:
+            # Use temp arrays for last mile
+            tmp_r = np.empty(16, dtype=np.int32)
+            tmp_c = np.empty(16, dtype=np.int32)
+            lm_len = _walk_within_block(b_cell_local, g_local, g_br, g_bc,
+                                        D_g, costs_flat, N, NBRS,
+                                        tmp_r, tmp_c, 0)
+            # Skip first cell (b*, already in path)
+            for i in range(1, lm_len):
+                path_r[off] = tmp_r[i]
+                path_c[off] = tmp_c[i]
+                off += 1
+
+        return path_r[:off], path_c[:off]
+
+
+# ===================================================================
 # PUBLIC API
 # ===================================================================
 
@@ -850,6 +1298,21 @@ def reconstruct_path(
 
     grid = oracle.grid
     gr, gc = g
+
+    # Use linked-list retrieval when structures are available
+    if _HAS_NUMBA and oracle.boundary_successor is not None:
+        NBRS = _NBRS_8 if grid.connectivity == 8 else _NBRS_4
+        pr, pc = _jit_retrieve_linked(
+            oracle.costs_flat, oracle.N, grid.connectivity,
+            s[0], s[1], gr, gc,
+            oracle.all_D, oracle.boundary_dist, oracle.block_bids,
+            _BI, NBRS, _LOCAL_TO_BI,
+            oracle.atlas, oracle.boundary_successor,
+            oracle.boundary_coords, oracle.boundary_local_bi,
+        )
+        return list(zip(pr.tolist(), pc.tolist()))
+
+    # Fallback: inline greedy walk
     g_br, g_bc = gr // 4, gc // 4
     g_local = (gr % 4) * 4 + (gc % 4)
 
