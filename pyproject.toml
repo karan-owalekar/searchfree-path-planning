@@ -8,6 +8,7 @@ dependencies = [
     "pygame-ce>=2.5",
     "numpy>=1.24",
     "numba>=0.60.0",
+    "cupy-cuda12x>=13.6.0",
 ]
 
 [project.scripts]

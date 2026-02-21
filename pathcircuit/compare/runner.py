@@ -31,12 +31,11 @@ def run_comparison(
     oracle_recon_ms: float,
     oracle_path: list[tuple[int, int]],
     oracle_cost: int,
+    use_gpu: bool = False,
 ) -> None:
     """Run Dijkstra and A*, then print a formatted comparison to stdout."""
-    dijk = dijkstra(grid, start, goal)
-    astar_res = astar(grid, start, goal)
-
     obstacle_count = int((grid.costs >= SENTINEL).sum())
+    mode_tag = " (GPU)" if use_gpu else ""
 
     print()
     print("  " + "=" * (BOX_WIDTH - 2))
@@ -49,24 +48,45 @@ def run_comparison(
     )
     print(info)
     print(f"  Start: {start}  Goal: {goal}")
+    if use_gpu:
+        print("  Mode: GPU (CUDA)")
     print()
 
     cost_str = str(oracle_cost) if oracle_cost < SENTINEL else "unreachable"
     path_len = str(len(oracle_path)) + " cells" if oracle_path else "N/A"
     query_ms = oracle_dist_ms + oracle_recon_ms
+    recon_label = "Recon" + mode_tag
     print(_box("Search-Free Planner", [
         ("Oracle Build", f"{oracle_build_ms:.2f} ms"),
         ("Distance Query", f"{oracle_dist_ms:.3f} ms"),
-        ("Path Reconstruction", f"{oracle_recon_ms:.3f} ms"),
+        (recon_label, f"{oracle_recon_ms:.3f} ms"),
         ("Total Query", f"{query_ms:.3f} ms"),
         ("Path Cost", cost_str),
         ("Path Length", path_len),
     ]))
     print()
 
+    if use_gpu:
+        from pathcircuit.gpu.dijkstra_gpu import gpu_dijkstra
+        gpu_res = gpu_dijkstra(grid, start, goal)
+
+        cost_str = str(gpu_res.cost) if gpu_res.cost < SENTINEL else "unreachable"
+        path_len = str(len(gpu_res.path)) + " cells" if gpu_res.path else "N/A"
+        print(_box("GPU Dijkstra (Bellman-Ford)", [
+            ("Time", f"{gpu_res.time_ms:.2f} ms"),
+            ("Iterations", str(gpu_res.iterations)),
+            ("Path Cost", cost_str),
+            ("Path Length", path_len),
+        ]))
+        print()
+
+    # CPU baselines always shown for reference
+    dijk = dijkstra(grid, start, goal)
+    astar_res = astar(grid, start, goal)
+
     cost_str = str(astar_res.cost) if astar_res.cost < SENTINEL else "unreachable"
     path_len = str(len(astar_res.path)) + " cells" if astar_res.path else "N/A"
-    print(_box("A*", [
+    print(_box("A* (CPU)", [
         ("Time", f"{astar_res.time_ms:.2f} ms"),
         ("Nodes Expanded", str(astar_res.nodes_expanded)),
         ("Path Cost", cost_str),
@@ -76,7 +96,7 @@ def run_comparison(
 
     cost_str = str(dijk.cost) if dijk.cost < SENTINEL else "unreachable"
     path_len = str(len(dijk.path)) + " cells" if dijk.path else "N/A"
-    print(_box("Dijkstra", [
+    print(_box("Dijkstra (CPU)", [
         ("Time", f"{dijk.time_ms:.2f} ms"),
         ("Nodes Expanded", str(dijk.nodes_expanded)),
         ("Path Cost", cost_str),

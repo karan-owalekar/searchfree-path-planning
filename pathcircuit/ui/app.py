@@ -20,9 +20,10 @@ NEIGHBOR_OPTIONS = ["8", "4"]
 
 
 class App:
-    def __init__(self, compare: bool = False):
+    def __init__(self, compare: bool = False, use_gpu: bool = False):
         pygame.init()
         self._compare = compare
+        self._use_gpu = use_gpu
 
         info = pygame.display.Info()
         w = max(theme.WINDOW_MIN_W, int(info.current_w * 0.75))
@@ -209,13 +210,23 @@ class App:
             self._oracle_dirty = False
             print(f"\n  Oracle built in {self._oracle_build_ms:.2f} ms")
 
-        t0 = time.perf_counter()
-        dist = query_distance(self._oracle, start, goal)
-        dist_ms = (time.perf_counter() - t0) * 1000.0
+        if self._use_gpu:
+            from pathcircuit.gpu.oracle_gpu import gpu_reconstruct_path
 
-        t1 = time.perf_counter()
-        path = reconstruct_path(self._oracle, start, goal)
-        recon_ms = (time.perf_counter() - t1) * 1000.0
+            t0 = time.perf_counter()
+            dist = query_distance(self._oracle, start, goal)
+            dist_ms = (time.perf_counter() - t0) * 1000.0
+
+            gpu_ms, path = gpu_reconstruct_path(self._oracle, start, goal)
+            recon_ms = gpu_ms
+        else:
+            t0 = time.perf_counter()
+            dist = query_distance(self._oracle, start, goal)
+            dist_ms = (time.perf_counter() - t0) * 1000.0
+
+            t1 = time.perf_counter()
+            path = reconstruct_path(self._oracle, start, goal)
+            recon_ms = (time.perf_counter() - t1) * 1000.0
 
         query_ms = dist_ms + recon_ms
 
@@ -225,14 +236,16 @@ class App:
             print(f"  Query: unreachable  ({query_ms:.2f} ms)")
         else:
             self._grid_view.path = path
-            self._status.text = f"Path found \u2014 cost: {dist}  length: {len(path)} cells  ({query_ms:.2f} ms)"
-            print(f"  Query: cost={dist}  length={len(path)}  (dist={dist_ms:.3f} ms  recon={recon_ms:.3f} ms)")
+            mode = " [GPU]" if self._use_gpu else ""
+            self._status.text = f"Path found \u2014 cost: {dist}  length: {len(path)} cells  ({query_ms:.2f} ms){mode}"
+            print(f"  Query: cost={dist}  length={len(path)}  (dist={dist_ms:.3f} ms  recon={recon_ms:.3f} ms){mode}")
 
         if self._compare:
             run_comparison(
                 self._grid, start, goal,
                 self._oracle_build_ms, dist_ms, recon_ms,
                 path, dist,
+                use_gpu=self._use_gpu,
             )
 
     # ---- rendering ----

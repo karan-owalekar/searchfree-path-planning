@@ -532,6 +532,133 @@ if _HAS_NUMBA:
 
         return path_r[:length], path_c[:length]
 
+    @_njit(cache=True, parallel=True)
+    def _reconstruct_parallel(costs, rows, cols, connectivity,  # type: ignore[misc]
+                              sr, sc, gr, gc,
+                              all_D, boundary_dist, block_bids, BI,
+                              g_br, g_bc, g_local):
+        """Parallel path reconstruction via successor-field architecture.
+
+        Pass 1 — d(cell, g) for ALL cells (prange across blocks)
+        Pass 2 — successor[cell] = argmin neighbor (prange across cells)
+        Pass 3 — follow successor pointers (zero-cost per step)
+        """
+        _S = np.int64(536_870_912)
+        blocks_r = rows // 4
+        blocks_c = cols // 4
+        n_blocks = blocks_r * blocks_c
+        total_cells = rows * cols
+
+        D_g = all_D[g_br * blocks_c + g_bc]
+        g_bids = block_bids[g_br, g_bc]
+
+        n_vg = np.int32(0)
+        vg_d = np.empty(12, dtype=np.int64)
+        vg_bid = np.empty(12, dtype=np.int32)
+        for b in range(12):
+            d = np.int64(D_g[BI[b], g_local])
+            if d < _S:
+                vg_d[n_vg] = d
+                vg_bid[n_vg] = g_bids[b]
+                n_vg += 1
+
+        # --- Pass 1: d(cell, g) for every cell, parallel across blocks ---
+        dist_to_goal = np.full(total_cells, _S, dtype=np.int64)
+
+        for block_idx in _prange(n_blocks):
+            br = block_idx // blocks_c
+            bc = block_idx % blocks_c
+            D_n = all_D[block_idx]
+            s_bids = block_bids[br, bc]
+            is_gb = (br == g_br) and (bc == g_bc)
+
+            mid = np.empty((12, 12), dtype=np.int64)
+            for a in range(12):
+                ba = s_bids[a]
+                for vb in range(n_vg):
+                    mid[a, vb] = np.int64(boundary_dist[ba, vg_bid[vb]])
+
+            for cell in range(16):
+                best = _S
+                for a in range(12):
+                    d_ca = np.int64(D_n[cell, BI[a]])
+                    if d_ca >= _S:
+                        continue
+                    for vb in range(n_vg):
+                        m = mid[a, vb]
+                        if m >= _S:
+                            continue
+                        val = d_ca + m + vg_d[vb]
+                        if val < best:
+                            best = val
+                if is_gb:
+                    ld = np.int64(D_n[cell, g_local])
+                    if ld < best:
+                        best = ld
+
+                cr = br * 4 + cell // 4
+                cc = bc * 4 + cell % 4
+                dist_to_goal[cr * cols + cc] = best
+
+        # --- Pass 2: build successor field, parallel across cells ---
+        successor = np.full(total_cells, np.int32(-1), dtype=np.int32)
+
+        if connectivity == 8:
+            dr = np.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=np.int32)
+            dc = np.array([-1, 0, 1, -1, 1, -1, 0, 1], dtype=np.int32)
+        else:
+            dr = np.array([-1, 0, 0, 1], dtype=np.int32)
+            dc = np.array([0, -1, 1, 0], dtype=np.int32)
+        n_nbrs = len(dr)
+
+        for idx in _prange(total_cells):
+            r = idx // cols
+            c = idx % cols
+            cu = np.int64(costs[idx])
+            if cu >= _S:
+                continue
+
+            best_next = np.int32(-1)
+            best_score = _S
+
+            for k in range(n_nbrs):
+                nr = r + dr[k]
+                nc = c + dc[k]
+                if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
+                    continue
+                nidx = nr * cols + nc
+                cn = np.int64(costs[nidx])
+                if cn >= _S:
+                    continue
+                score = cu + cn + dist_to_goal[nidx]
+                if score < best_score:
+                    best_score = score
+                    best_next = np.int32(nidx)
+
+            successor[idx] = best_next
+
+        # --- Pass 3: follow pointers ---
+        max_len = total_cells
+        path_r = np.empty(max_len, dtype=np.int32)
+        path_c = np.empty(max_len, dtype=np.int32)
+        path_r[0] = np.int32(sr)
+        path_c[0] = np.int32(sc)
+        length = np.int32(1)
+
+        cur = sr * cols + sc
+        goal_idx = gr * cols + gc
+
+        while cur != goal_idx and length < max_len:
+            nxt = successor[cur]
+            if nxt < 0:
+                break
+            path_r[length] = np.int32(nxt // cols)
+            path_c[length] = np.int32(nxt % cols)
+            length += np.int32(1)
+            cur = nxt
+
+        return path_r[:length], path_c[:length]
+
     @_njit(cache=True)
     def _jit_reconstruct(costs, rows, cols, connectivity,  # type: ignore[misc]
                          sr, sc, gr, gc, block_dists):
