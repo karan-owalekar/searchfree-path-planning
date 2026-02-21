@@ -1,6 +1,6 @@
 # Implementation Documentation: Search-Free Path Planner
 
-This document details how the search-free algebraic pathfinding algorithm is implemented in code. It covers every module in `pathcircuit/core/` and `pathcircuit/grid.py`, explaining what each piece does, why it was done that way, and how the parts connect.
+This document details how the search-free algebraic pathfinding algorithm is implemented in code. It covers every module in `pathcircuit/core/`, `pathcircuit/gpu/`, `pathcircuit/grid.py`, and `pathcircuit/warmup.py`, explaining what each piece does, why it was done that way, and how the parts connect.
 
 ---
 
@@ -14,25 +14,37 @@ This document details how the search-free algebraic pathfinding algorithm is imp
 6. [Hierarchical Composition](#6-hierarchical-composition)
 7. [Un-Condensation](#7-un-condensation)
 8. [Oracle and Query System](#8-oracle-and-query-system)
-9. [Pipeline Orchestration](#9-pipeline-orchestration)
-10. [Design Decisions and Trade-offs](#10-design-decisions-and-trade-offs)
+9. [GPU Acceleration](#9-gpu-acceleration)
+10. [Pipeline Orchestration](#10-pipeline-orchestration)
+11. [Warmup and JIT Caching](#11-warmup-and-jit-caching)
+12. [Design Decisions and Trade-offs](#12-design-decisions-and-trade-offs)
 
 ---
 
 ## 1. Project Layout
 
-The algorithm lives entirely within the `pathcircuit/` package. The core computation is separated from the UI and comparison modules:
+The algorithm lives entirely within the `pathcircuit/` package. The core computation is separated from the UI, comparison, and GPU modules:
 
 ```
 pathcircuit/
 ├── grid.py              # Grid data structure (shared by all modules)
+├── warmup.py            # Eager JIT / GPU kernel compilation
 ├── core/
-│   ├── tropical.py      # Tropical semiring primitives (add, min, matmul)
+│   ├── tropical.py      # Tropical semiring primitives (min-plus matmul, JIT-compiled)
 │   ├── base_block.py    # Phase 1: 4×4 base block APSP + transfer matrices
-│   ├── hierarchy.py     # Phase 2: hierarchical merge (Schur complement)
+│   ├── hierarchy.py     # Phase 2: hierarchical merge (Schur complement, JIT assembly)
 │   ├── uncondense.py    # Phase 3a: top-down distance recovery
-│   ├── oracle.py        # Phase 3b: ancestor chains, expansion, queries
-│   └── pipeline.py      # Orchestrator: ties all phases together
+│   ├── oracle.py        # Phase 3b: flat boundary table, linked-list retrieval, JIT kernels
+│   └── pipeline.py      # Orchestrator: ties all phases together (parallel build)
+├── gpu/
+│   ├── __init__.py      # CUDA environment setup (preloads NVIDIA libs)
+│   ├── boundary_gpu.py  # GPU boundary table build (CUDA shared-memory kernel)
+│   ├── oracle_gpu.py    # GPU path reconstruction (successor-field CUDA kernels)
+│   └── dijkstra_gpu.py  # GPU Dijkstra via parallel Bellman-Ford
+├── compare/
+│   ├── runner.py        # Algorithm comparison harness
+│   ├── astar.py         # A* baseline (Numba JIT)
+│   └── dijkstra.py      # Dijkstra baseline (Numba JIT)
 ```
 
 The algorithm proceeds in four sequential phases:
@@ -40,7 +52,7 @@ The algorithm proceeds in four sequential phases:
 1. **Base block computation** — solve all-pairs shortest paths within every 4×4 tile.
 2. **Hierarchical composition** — merge tiles bottom-up using the tropical Schur complement.
 3. **Un-condensation** — propagate global distances top-down through the hierarchy.
-4. **Oracle construction** — build ancestor chains for search-free queries.
+4. **Oracle construction** — build flat boundary distance table, and optionally linked-list structures for near-instant path retrieval.
 
 ---
 
@@ -50,12 +62,20 @@ Defined in `pyproject.toml`:
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| `numpy` | >= 1.24 | All matrix operations (tropical matmul, Kleene closure, distance tables). NumPy's vectorised broadcasting turns the O(n³) tropical matrix multiply into a single `a[:, :, np.newaxis] + b[np.newaxis, :, :]` expression, which is orders of magnitude faster than triple-nested Python loops. |
+| `numpy` | >= 1.24 | All matrix operations (tropical matmul, Kleene closure, distance tables). NumPy's vectorised broadcasting is the fallback path; the hot loops are JIT-compiled by Numba. |
+| `numba` | >= 0.59 | JIT compilation of all performance-critical kernels. Provides `@njit(cache=True)` for ahead-of-time compilation, `prange` for parallel loops, and `nogil=True` for releasing the GIL in threaded contexts. |
 | `pygame-ce` | >= 2.5 | UI only — not used by the algorithm. |
+| `cupy-cuda12x` | >= 13.0 | Optional GPU acceleration via `cp.RawKernel` for custom CUDA C kernels. Only loaded when `--gpu` is passed. |
 
-**Why NumPy instead of pure Python:** The algorithm's inner loop is tropical matrix multiplication, which is structurally identical to standard matmul but with `(min, +)` replacing `(+, ×)`. A 16×16 matmul is 4096 additions and 256 minimisations — tolerable in Python — but the hierarchy produces matrices up to ~120×120 at the root level of a 64×64 grid. At that size, pure Python would be 1000× slower than NumPy's vectorised path. Every matrix in the system (weight matrices, transfer matrices, D_global tables) is stored as `np.ndarray` with dtype `int32`.
+**Why Numba:** The algorithm's inner loops (tropical matmul, hierarchy expansion, boundary table construction) are tight numerical kernels operating on contiguous NumPy arrays. Numba's `@njit` compiles these to native machine code with zero Python overhead. Key features used:
+- `cache=True` — persists compiled bytecode to `__pycache__/*.nbi`/`.nbc` files, so subsequent launches skip compilation.
+- `nogil=True` — releases Python's GIL, enabling true parallelism with `ThreadPoolExecutor`.
+- `prange` — parallel for-loops that Numba distributes across CPU cores.
+- Numba-compatible data structures only (NumPy arrays, scalars, tuples) — no Python dicts or lists in hot paths.
 
-**Why int32:** The SENTINEL value is 2²⁹ = 536,870,912. Two SENTINEL values summed stay below the int32 max of 2³¹ − 1, so overflow is impossible within int32 arithmetic. Intermediate sums during matmul are computed in int64 to avoid overflow when summing two non-SENTINEL values that could theoretically exceed int32 range, then clipped back to SENTINEL.
+**Why CuPy over PyCUDA/raw CUDA:** CuPy's `RawKernel` provides the same low-level control as raw CUDA C (custom kernels, shared memory, atomics) with a much simpler Python API. It also handles NVRTC kernel compilation, memory management, and stream synchronization automatically.
+
+**Why int32:** The SENTINEL value is 2²⁹ = 536,870,912. Two SENTINEL values summed stay below the int32 max of 2³¹ − 1, so overflow is impossible. Intermediate sums during matmul use int64 to prevent overflow before clipping.
 
 ---
 
@@ -88,18 +108,11 @@ This is a vertex-cost model: traversing an edge "pays" for entering both endpoin
 
 ### Connectivity
 
-The grid supports both 4-connected (cardinal directions only) and 8-connected (cardinal + diagonal) movement. This is set at construction time via the `connectivity` parameter (4 or 8). Neighbor enumeration uses precomputed offset lists:
-
-```python
-CARDINAL_OFFSETS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-DIAGONAL_OFFSETS = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-```
+The grid supports both 4-connected (cardinal directions only) and 8-connected (cardinal + diagonal) movement. This is set at construction time via the `connectivity` parameter (4 or 8). Neighbor enumeration uses precomputed offset lists.
 
 ### Grid Padding
 
 The hierarchical algorithm requires the grid dimensions to be a power-of-2 multiple of 4 (so the grid can be recursively halved into 4×4 base blocks). The `to_padded()` method computes the smallest valid dimension ≥ max(rows, cols) and creates a square padded grid. Padding cells are filled with SENTINEL (treated as obstacles), so they never participate in shortest paths.
-
-The valid dimension formula: find the smallest `n` such that `n >= d`, `n` is a multiple of 4, and `n / 4` is a power of 2. For example, a 12×12 grid pads to 16×16 (16/4 = 4 = 2²). A 20×20 grid pads to 32×32 (32/4 = 8 = 2³).
 
 ---
 
@@ -113,23 +126,6 @@ The entire algorithm is built on the **tropical semiring** (ℝ≥0 ∪ {∞}, m
 - The additive identity (zero) is `∞` (SENTINEL)
 - The multiplicative identity (one) is `0`
 
-### Scalar Operations
-
-```python
-SENTINEL = 536_870_912  # 2^29, represents ∞
-
-def tropical_add(a, b):
-    # a ⊕ b in the tropical semiring = ordinary a + b
-    # Returns SENTINEL if either input is SENTINEL (∞ + x = ∞)
-    # Clamps overflow to SENTINEL
-
-def tropical_min(a, b):
-    # min(a, b) — the "addition" in the tropical semiring
-    return a if a <= b else b
-```
-
-The early-exit on SENTINEL in `tropical_add` prevents computing `SENTINEL + x` which could overflow even in int64.
-
 ### Matrix Multiplication
 
 ```python
@@ -137,28 +133,19 @@ def tropical_matmul(A, B):
     # C[i,j] = min_k (A[i,k] + B[k,j])
 ```
 
-This is the core computational primitive. Instead of a triple-nested loop, it uses NumPy broadcasting:
+Two implementations exist, selected automatically:
 
-```python
-a = A.astype(np.int64)
-b = B.astype(np.int64)
-sums = a[:, :, np.newaxis] + b[np.newaxis, :, :]  # shape (n, m, p)
-sums = np.clip(sums, 0, SENTINEL)
-C = np.min(sums, axis=1).astype(np.int32)
-```
+**Numba JIT path** (`_matmul_jit`): A triple-nested loop compiled to native code. Decorated with `@njit(cache=True, nogil=True)` so it releases the GIL and can run in parallel threads. This is the hot path used during oracle construction.
 
-This creates a 3D tensor of all pairwise sums and then takes the minimum along the middle axis. The int64 upcast prevents overflow during the addition step; clipping to `[0, SENTINEL]` ensures the result stays in valid range before downcasting to int32.
-
-**Memory trade-off:** For an n×n matrix, this allocates an O(n³) intermediate tensor. For the sizes in this algorithm (n ≤ ~120), this is at most ~14 MB — acceptable on modern hardware and far faster than interpreted loops.
+**NumPy fallback path**: Uses broadcasting `a[:, :, np.newaxis] + b[np.newaxis, :, :]` to create a 3D tensor, then takes `np.min` along the middle axis. Used only if Numba is unavailable.
 
 ### Witness Recording
 
-```python
-def tropical_matmul_with_witness(A, B):
-    # Returns (C, W) where C[i,j] = min_k(A[i,k]+B[k,j]) and W[i,j] = argmin_k
-```
+`tropical_matmul_with_witness` returns `(C, W)` where `W[i,j] = argmin_k`. The Numba path (`_matmul_witness_jit`) also uses `nogil=True` for parallel execution. Witnesses are used for path reconstruction via recursive bisection within base blocks.
 
-The witness matrix `W` records *which* intermediate index `k` achieved the minimum. This is used for path reconstruction via recursive bisection: if the shortest path from `i` to `j` goes through midpoint `k = W[i,j]`, it can be decomposed into subpaths `i→k` and `k→j`. The witnesses are stored at each level for potential future use, though the current implementation uses greedy reconstruction instead.
+### Min-Plus Matrix-Vector Product
+
+`minplus_mv(D, bi, bd, n)` computes a matrix-vector product used during boundary table construction: `d_new[k] = min_b(bd[b] + D[bi[b], k])`. JIT-compiled with `nogil=True`.
 
 ---
 
@@ -166,13 +153,13 @@ The witness matrix `W` records *which* intermediate index `k` achieved the minim
 
 **File:** `pathcircuit/core/base_block.py`
 
-This is Phase 1 of the algorithm. The padded N×N grid is divided into (N/4)² non-overlapping 4×4 tiles called **base blocks**. For each base block, we compute:
-1. The 16×16 all-pairs shortest path matrix `D`
-2. The 12×12 **transfer matrix** `T` (a condensed summary of boundary-to-boundary distances)
+This is Phase 1. The padded N×N grid is divided into (N/4)² non-overlapping 4×4 tiles. For each tile:
 
-### Cell Indexing
+1. The 16×16 **weight matrix** `W` is constructed via `_build_weight_matrix_jit` — a Numba JIT kernel that takes a flattened costs array, avoiding Python-level grid lookups.
+2. APSP is computed via 4 rounds of tropical repeated squaring: `D = W¹⁶`.
+3. The 12×12 **transfer matrix** `T` is extracted from the boundary rows/columns of `D`.
 
-The 16 cells in a 4×4 block are numbered in row-major order (0–15):
+### Cell Layout
 
 ```
  0  1  2  3       B  B  B  B
@@ -181,81 +168,15 @@ The 16 cells in a 4×4 block are numbered in row-major order (0–15):
 12 13 14 15       B  B  B  B
 ```
 
-Of these 16 cells, 12 are **boundary cells** (on the perimeter of the block) and 4 are **interior cells** (the 2×2 centre):
+12 boundary cells (B), 4 interior cells (ι). `BOUNDARY_INDICES = [0, 1, 2, 3, 4, 7, 8, 11, 12, 13, 14, 15]`.
 
-```python
-BOUNDARY_INDICES = [0, 1, 2, 3, 4, 7, 8, 11, 12, 13, 14, 15]
-INTERIOR_INDICES = [5, 6, 9, 10]
-```
+### Neighbour Tables
 
-### Intra-Block Adjacency
+`NEIGHBORS_4` and `NEIGHBORS_8` are precomputed as Numba-compatible flat arrays (`_NEIGH_FLAT_4`, `_NEIGH_FLAT_8`, `_NEIGH_COUNT_4`, `_NEIGH_COUNT_8`) for use in JIT kernels that cannot access Python dicts.
 
-The adjacency within a 4×4 block is precomputed as a dictionary mapping each local cell index to its list of neighbours. For 4-connectivity, `NEIGHBORS_4` lists cardinal neighbours. For 8-connectivity, `NEIGHBORS_8` extends this with diagonal neighbours. These are computed once at module load time:
+### Parallelization
 
-```python
-NEIGHBORS_8: dict[int, list[int]] = {}
-for _cell in range(16):
-    _r, _c = divmod(_cell, 4)
-    _nbrs = list(NEIGHBORS_4[_cell])
-    for _dr, _dc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-        _nr, _nc = _r + _dr, _c + _dc
-        if 0 <= _nr < 4 and 0 <= _nc < 4:
-            _nbrs.append(_nr * 4 + _nc)
-    NEIGHBORS_8[_cell] = _nbrs
-```
-
-### Weight Matrix Construction
-
-`build_weight_matrix(br, bc, grid)` creates the 16×16 adjacency matrix `W` for block `(br, bc)`:
-- `W[i, i] = 0` (self-loops cost nothing)
-- `W[i, j] = cost(i) + cost(j)` if `i` and `j` are adjacent, respecting connectivity mode
-- `W[i, j] = SENTINEL` otherwise
-
-### All-Pairs Shortest Paths via Repeated Squaring
-
-Instead of running Dijkstra or Floyd-Warshall 16 times, the implementation computes APSP by **repeated squaring** of the weight matrix under tropical multiplication:
-
-```python
-S1, w1 = tropical_matmul_with_witness(W, W)      # W² — paths of length ≤ 2
-S2, w2 = tropical_matmul_with_witness(S1, S1)    # W⁴ — paths of length ≤ 4
-S3, w3 = tropical_matmul_with_witness(S2, S2)    # W⁸ — paths of length ≤ 8
-D,  w4 = tropical_matmul_with_witness(S3, S3)    # W¹⁶ — paths of length ≤ 16
-```
-
-After 4 squarings, `D = W¹⁶`. Since the longest simple path in a 4×4 grid has at most 15 edges (visiting all 16 cells), W¹⁶ captures all shortest paths. The key insight: if `W` has zero diagonal (which it does), then `W^k[i, j] ≤ W^(k-1)[i, j]` for all k, so the sequence is monotonically non-increasing and stabilises once the exponent exceeds the graph diameter.
-
-**Why repeated squaring over Floyd-Warshall:** Both are O(n³ log n) vs O(n³) for a fixed n=16, so the constant-factor difference is negligible. But repeated squaring produces witness matrices for free that enable recursive path bisection, and it maps cleanly to the vectorised NumPy matmul.
-
-### Transfer Matrix Extraction
-
-The **transfer matrix** `T` is a 12×12 submatrix of `D` containing only the boundary-to-boundary distances:
-
-```python
-T[a, b] = D[BOUNDARY_INDICES[a], BOUNDARY_INDICES[b]]
-```
-
-This is the block's "summary" for the hierarchical merge: the interior cells have been implicitly eliminated, and `T` encodes how quickly you can transit between any two perimeter cells, routing through the interior as needed.
-
-### The BaseBlock Data Structure
-
-```python
-@dataclass
-class BaseBlock:
-    block_row: int                              # block grid position
-    block_col: int
-    D: np.ndarray                               # 16×16 APSP matrix
-    T: np.ndarray                               # 12×12 transfer matrix
-    witnesses: list[np.ndarray]                 # 4 witness matrices from squaring
-    boundary_cells: list[tuple[int, int]]       # 12 global (row, col) coords
-    boundary_cell_to_index: dict[...]           # reverse lookup
-    region_top: int                             # top-left corner in global grid
-    region_left: int
-    D_global: np.ndarray | None                 # filled during un-condensation
-    D_global_cells: list[...] | None
-    D_global_cell_to_index: dict[...] | None
-```
-
-The `boundary_cells` list maps boundary index (0–11) to global grid coordinates. `boundary_cell_to_index` provides the reverse mapping. These are essential during the merge phase, where cells from different blocks need to be matched by their global position.
+Base block computation is parallelized in the pipeline via `ThreadPoolExecutor` when the number of blocks exceeds 64. Each block's computation is independent, and the `nogil=True` on tropical matmul/witness kernels ensures true parallel execution without GIL contention.
 
 ---
 
@@ -263,137 +184,25 @@ The `boundary_cells` list maps boundary index (0–11) to global grid coordinate
 
 **File:** `pathcircuit/core/hierarchy.py`
 
-This is Phase 2. Base blocks are merged bottom-up in a quadtree pattern: four adjacent blocks form a 2×2 group, which is merged into a single larger block. This repeats until the entire grid is a single block at the root.
+This is Phase 2. Base blocks are merged bottom-up in a quadtree: four adjacent blocks form a 2×2 group merged via three binary merges (two horizontal, one vertical).
 
-### Merge Pattern
+### Joint Matrix Assembly — JIT-Compiled
 
-At each level, four sub-blocks `[A, B; C, D]` are combined through three binary merges:
+The merge's central computation is the **joint matrix** `M`, an (|E| + |S|) × (|E| + |S|) matrix. This assembly was a major Python bottleneck because it involves iterating over all cell pairs, checking adjacency, and looking up transfer matrix entries.
 
-```
-[A] [B]       Merge 1 (horizontal): A ∥ B → AB
-[C] [D]       Merge 2 (horizontal): C ∥ D → CD
-              Merge 3 (vertical):   AB ⫽ CD → ABCD
-```
+The function `_assemble_jit` is a Numba JIT kernel that receives pre-flattened NumPy arrays (boundary cell types, indices, coordinates, costs) and fills the joint matrix entirely in compiled code. The Python wrapper `_assemble_joint_matrix` converts the Python-level lists and dicts into these flat arrays, then dispatches to the JIT kernel.
 
-All three MergeNodes are stored because un-condensation needs them.
-
-### The MergeNode Data Structure
-
-```python
-@dataclass
-class MergeNode:
-    level: int                          # hierarchy depth
-    merge_type: str                     # "horizontal" or "vertical"
-    region_top, region_left: int        # covered grid region
-    region_height, region_width: int
-    boundary_size: int                  # |E| — external boundary cell count
-    boundary_cells: list[...]           # ordered boundary coordinates
-    boundary_cell_to_index: dict[...]
-    T: np.ndarray                       # transfer matrix for this merged block
-    interface_size: int                 # |S| — interface cell count
-    interface_cells: list[...]
-    M_SS_star: np.ndarray               # Kleene closure of interface sub-matrix
-    M_ES_times_MSS_star: np.ndarray     # precomputed product for un-condensation
-    M_ES: np.ndarray                    # boundary-to-interface distances
-    M_SE: np.ndarray                    # interface-to-boundary distances
-    kleene_witnesses: list[np.ndarray]
-    child_left: BlockLike               # left/top child
-    child_right: BlockLike              # right/bottom child
-    h_merge_left: MergeNode | None      # horizontal sub-merges (for vertical nodes)
-    h_merge_right: MergeNode | None
-    D_global: np.ndarray | None         # filled during un-condensation
-    D_global_cells: list[...] | None
-    D_global_cell_to_index: dict[...] | None
-```
-
-### Partition Identification
-
-When two blocks are merged, their shared edge cells are classified:
-
-- **Interface cells (S):** Cells on the shared edge that are *not* corners of the merged region. These will be "eliminated" (condensed out) by the Schur complement. For a horizontal merge, these are the non-corner cells on the right column of A and the left column of B.
-- **External cells (E):** All boundary cells of the merged block (the outer perimeter of the combined region). These survive the merge and become the new block's boundary.
-
-For a horizontal merge of two blocks with height h:
-- |I_A| = |I_B| = h − 2 (shared-edge interior cells from each side)
-- |S| = 2(h − 2) (total interface cells)
-- |E| = 2h + 2(w_A + w_B) − 4 (perimeter of the combined region)
-
-### Boundary Enumeration
-
-The `enumerate_boundary` function produces a deterministic ordering of boundary cells for any rectangular region: top edge left-to-right, right edge top-to-bottom (excluding corners), bottom edge left-to-right, left edge top-to-bottom (excluding corners). This consistent ordering is critical — every reference to "boundary cell index i" throughout the entire hierarchy must agree on this ordering.
-
-### Joint Matrix Assembly
-
-The merge's central computation is the **joint matrix** `M`, an (|E| + |S|) × (|E| + |S|) matrix partitioned into four blocks:
-
-```
-M = [ M_EE  M_ES ]
-    [ M_SE  M_SS ]
-```
-
-Where:
-- `M_EE[i, j]`: distance between external cells `i` and `j`, looked up from the child transfer matrices if both cells belong to the same child, or set to the direct edge weight if they're grid-adjacent cells from different children.
-- `M_ES[i, j]` and `M_SE[j, i]`: distance between an external cell and an interface cell, from the same child's transfer matrix. If they're from different children but grid-adjacent (relevant in 8-connectivity), the direct edge weight is used.
-- `M_SS[i, j]`: distance between interface cells. Same-child pairs use the transfer matrix. Cross-child pairs use the direct edge weight if grid-adjacent (same row for horizontal merges, same column for vertical).
-
-**8-connectivity extension:** The original spec (4-connectivity) only needed to check same-row adjacency for cross-child interface pairs. For 8-connectivity, the `are_grid_adjacent` function uses Chebyshev distance (max of absolute row and column differences equals 1) to handle diagonal connections between cells from different children. This captures diagonal cross-block edges that don't appear in either child's transfer matrix.
-
-### Kleene Closure
-
-The Kleene closure `M_SS*` computes all-pairs shortest paths among the interface cells:
-
-```python
-def kleene_closure(M_SS, s_size):
-    num_sq = max(1, ceil(log2(s_size))) if s_size > 1 else 1
-    R = M_SS.copy()
-    for _ in range(num_sq):
-        R_new, W_t = tropical_matmul_with_witness(R, R)
-        R = R_new
-    return R, witnesses
-```
-
-The number of squarings is ⌈log₂|S|⌉, which guarantees the exponent exceeds |S| (the maximum simple path length among S cells). Because the diagonal of M_SS is zero, each squaring can only decrease entries (the previous value is always ≤ the new value), so no separate accumulation step is needed — the squared result automatically includes the old result as a special case (routing through the identity element k = i).
+**Why this matters:** For a 64×64 grid, the hierarchy has ~255 nodes with matrices up to 252×252. The original pure-Python assembly was the dominant cost of hierarchy construction (~1000ms). The JIT version reduces this to ~50ms.
 
 ### Tropical Schur Complement
 
-The transfer matrix `T_C` for the merged block is computed via the tropical Schur complement:
+The transfer matrix for the merged block:
 
 ```
 T_C = M_EE ⊕ (M_ES ⊗ M_SS* ⊗ M_SE)
 ```
 
-In code:
-
-```python
-M_ES_times_MSS_star = tropical_matmul(M_ES, M_SS_star)
-schur_product = tropical_matmul(M_ES_times_MSS_star, M_SE)
-T_C = np.minimum(M_EE, schur_product)
-```
-
-This is the algebraic analogue of Gaussian elimination: the interface cells are "eliminated" by computing the best path from any external cell to any other external cell that optionally routes through the interface. `M_EE` captures direct paths; `M_ES ⊗ M_SS* ⊗ M_SE` captures paths that detour through the interface. The element-wise minimum takes the better of the two.
-
-`M_ES_times_MSS_star` (the product `M_ES ⊗ M_SS*`) is stored on the MergeNode because it's reused during un-condensation.
-
-### Full Hierarchy Construction
-
-```python
-def build_hierarchy(base_blocks, N, grid):
-    L = int(log2(N / 4))     # number of levels
-    prev_level = base_blocks  # 2D grid of blocks
-
-    for level in range(L):
-        # Group blocks into 2×2 quads, merge each quad
-        for each 2×2 group (A, B, C, D):
-            AB = horizontal_merge(A, B, level, grid)
-            CD = horizontal_merge(C, D, level, grid)
-            ABCD = vertical_merge(AB, CD, level, grid)
-            ABCD.h_merge_left = AB    # store sub-merges
-            ABCD.h_merge_right = CD
-
-    return root  # single block covering the entire grid
-```
-
-Each level halves the number of blocks in each dimension. After L levels, a single root block remains.
+`M_ES_times_MSS_star` is stored on the MergeNode for reuse during un-condensation.
 
 ---
 
@@ -401,58 +210,15 @@ Each level halves the number of blocks in each dimension. After L levels, a sing
 
 **File:** `pathcircuit/core/uncondense.py`
 
-This is Phase 3a. During hierarchical composition, interface cells were eliminated by the Schur complement — their distances were folded into the transfer matrix but the individual cell-to-cell values were lost. Un-condensation recovers them.
-
-### Top-Down Processing
-
-Un-condensation works **top-down**, starting from the root:
-
-1. The root's `D_global` is initialised to its own transfer matrix `T` (boundary-to-boundary distances).
-2. At each merge node, interface distances are recovered using the stored Schur complement data.
-3. The expanded `D_global` is propagated down to child nodes.
-
-### Recovery at a Single Merge Node
-
-Given a node with `D_global = D_EE` (boundary distances, set by its parent), the un-condensation recovers:
+Phase 3a. Top-down recovery of interface distances eliminated by the Schur complement. Starting from the root (whose `D_global = T`), each merge node recovers:
 
 ```
-D_ES = D_EE ⊗ (M_ES ⊗ M_SS*)    — external-to-interface distances
-D_SE = D_ES^T                     — by symmetry of shortest paths
-D_SS = M_SS* ⊕ (M_SE ⊗ D_EE ⊗ M_ES)  — interface-to-interface distances
+D_ES = D_EE ⊗ (M_ES ⊗ M_SS*)
+D_SE = D_ES^T
+D_SS = M_SS* ⊕ (M_SE ⊗ D_EE ⊗ M_ES)
 ```
 
-The key formula for `D_SS`: the first term `M_SS*` captures shortest paths among interface cells that stay within the local merge. The second term `M_SE ⊗ D_EE ⊗ M_ES` captures paths that leave through the boundary, traverse the global network, and re-enter. The minimum of both gives the true global shortest path.
-
-After recovery, the node's `D_global` is expanded from |E|×|E| to (|E|+|S|)×(|E|+|S|):
-
-```python
-D_full[   :nE,    :nE  ] = D_EE
-D_full[   :nE,  nE:    ] = D_ES
-D_full[ nE:  ,    :nE  ] = D_SE
-D_full[ nE:  ,  nE:    ] = D_SS
-```
-
-### Propagation to Children
-
-`propagate_D_global(parent, child)` extracts the sub-matrix of `parent.D_global` corresponding to the child's boundary cells. Each child boundary cell must appear somewhere in the parent's `D_global_cells` list (as either a boundary or interface cell of the parent). The function finds these indices and extracts the corresponding rows and columns:
-
-```python
-for cell in child.boundary_cells:
-    indices.append(parent.D_global_cell_to_index[cell])
-child.D_global = parent.D_global[np.ix_(idx, idx)]
-```
-
-This gives the child its own `D_EE` (global boundary distances), which accounts for paths that leave the child, traverse the wider grid, and return.
-
-### Recursive Subtree Processing
-
-The recursion handles the three-node structure at each 2×2 group:
-
-1. Un-condense the vertical merge node ABCD (recover its interface cells).
-2. Propagate `D_global` from ABCD to its horizontal sub-merges AB and CD.
-3. Un-condense AB and CD (recover their interface cells).
-4. Propagate from AB to its children A and B; from CD to C and D.
-5. If A, B, C, D are themselves MergeNodes (not base blocks), recurse.
+The expanded `D_global` (boundary + interface cells) is propagated to child nodes via `propagate_D_global`, which extracts the sub-matrix corresponding to each child's boundary cells.
 
 ---
 
@@ -460,129 +226,197 @@ The recursion handles the three-node structure at each 2×2 group:
 
 **File:** `pathcircuit/core/oracle.py`
 
-This is Phase 3b. After un-condensation, every node in the hierarchy has a `D_global` table containing shortest distances among its boundary and interface cells. The oracle wraps this into a query-answerable structure.
+This is the largest and most performance-critical module. It contains:
+- The flat boundary distance table (replaces hierarchy traversal at query time)
+- Linked-list path retrieval structures (atlas + successor table)
+- All JIT-compiled query and build kernels
 
 ### The Oracle Data Structure
 
 ```python
 @dataclass
 class Oracle:
-    base_blocks: list[list[BaseBlock]]          # the (N/4)² base blocks
-    N: int                                       # padded grid size
-    grid: Grid                                   # the padded grid
-    ancestor_chains: dict[tuple[int,int], list[MergeNode]]
+    base_blocks: list[list[BaseBlock]]
+    all_D: np.ndarray                    # [n_blocks, 16, 16] all base block D matrices
+    N: int
+    grid: Grid
+    boundary_dist: np.ndarray            # [B, B] flat boundary-to-boundary distances
+    block_bids: np.ndarray               # [blocks_r, blocks_c, 12] boundary IDs per block
+    costs_flat: np.ndarray               # [N*N] flattened grid costs for JIT
+    atlas: np.ndarray | None             # [blocks_r, blocks_c, 12, 12, 9] path atlas
+    successor: np.ndarray | None         # [B, B] boundary successor table
+    boundary_coords: np.ndarray | None   # [B, 2] global coords per boundary cell
+    boundary_local_bi: np.ndarray | None # [B] local boundary index per cell
 ```
 
-The `ancestor_chains` dictionary is the key structure for search-free queries. For each base block `(br, bc)`, it stores the ordered list of MergeNodes from the block's immediate parent up to the root.
+### Flat Boundary Distance Table
 
-### Ancestor Chain Construction
+The key architectural insight: after un-condensation, every boundary cell's global distances are scattered across `D_global` tables in the hierarchy. Instead of traversing the hierarchy at query time, all boundary-to-boundary distances are extracted into a single `B×B` flat table during build.
 
-`_build_ancestor_chains(root)` walks the hierarchy tree recursively. As it descends, it accumulates a `suffix` list representing the chain of ancestors from the current position up to the root. When it reaches a base block, that suffix becomes the block's ancestor chain.
+For a 64×64 grid: B = 3072 boundary cells → ~36MB table. This eliminates all hierarchy traversal from queries, reducing distance lookups to O(1) array reads.
 
-The chain is built **bottom-up** by prepending nodes during recursion:
+#### Build Algorithm — Hierarchy Expansion
 
-```python
-def walk(node, suffix):
-    if isinstance(node, BaseBlock):
-        chains[(node.block_row, node.block_col)] = list(suffix)
-        return
-    if node.h_merge_left is not None:
-        for h_merge in (node.h_merge_left, node.h_merge_right):
-            child_suffix = [h_merge, node] + suffix  # prepend
-            for child in (h_merge.child_left, h_merge.child_right):
-                walk(child, child_suffix)
-    else:
-        child_suffix = [node] + suffix
-        for child in (node.child_left, node.child_right):
-            walk(child, child_suffix)
-```
+For each of the B source boundary cells, distances are propagated through the entire hierarchy tree by iterating over all tree nodes in a specific order:
 
-The prepend (`[h_merge, node] + suffix`) ensures the chain starts with the immediate parent and ends with the root. This ordering is critical for the expansion algorithm: the initial distances from a base block's boundary cells must first be propagated to the immediate parent's `D_global` table (where those boundary cells appear), then successively to larger and larger ancestor tables.
+1. **Tree linearization** (`_linearize_nodes`): All hierarchy nodes are collected in DFS order. Their `D_global` matrices, cell indices, and sizes are flattened into contiguous NumPy arrays (`tree_D_flat`, `tree_cell_flat`, etc.) for JIT access.
 
-**Why bottom-up order matters:** An earlier implementation used top-down order (root first). This caused the expansion to start at the highest level, where the base block's boundary cells are a tiny subset of the root's large `D_global` table. The expansion had very few "bridge" cells to work with, producing wildly overestimated distances. Starting from the immediate parent guarantees all 12 boundary cells of the base block are present as bridges, giving the densest and most accurate initial expansion.
+2. **Ancestor chain ordering**: For each base block, its ancestor nodes are processed first (nearest to farthest), followed by all remaining nodes. This ensures distances propagate outward from the source through its immediate hierarchy before reaching distant parts of the grid.
 
-### Search-Free Hierarchical Expansion
+3. **JIT expansion kernel** (`_jit_expand_indexed`): For each tree node, finds which of the node's cells already have known distances ("bridge cells"), then computes `d_new[k] = min(d[k], min_b(bridge_d[b] + D_global[b, k]))` for all cells in the node.
 
-`_expand_through_hierarchy(chain, initial)` is the core search-free operation. It projects a set of initial distances (from a source or goal cell to its base block's boundary cells) upward through every node in the ancestor chain using **min-plus matrix-vector products**.
+4. **Per-block processing** (`_process_block_boundary`): Processes all 12 boundary cells of one block. Uses a pre-allocated scratch buffer (`d_buf`, int64[N*N]) that is reset and reused for each of the 12 boundary cells, avoiding 12 separate allocations per block. Decorated with `@njit(nogil=True)` for parallel execution.
 
-For each node in the chain:
+5. **Parallel dispatch**: When there are ≥4 blocks, a `ThreadPoolExecutor` submits all blocks as independent tasks. Since `_process_block_boundary` releases the GIL, threads run truly in parallel.
 
-1. **Identify bridge cells:** cells that are both in the current distance dictionary `d` and in the node's `D_global_cells`.
-2. **Vectorised expansion:** compute `d_new[k] = min_b (d[bridge_b] + D_global[bridge_b, k])` for all cells `k` in the node's D_global.
-3. **Update:** if `d_new[k]` improves the known distance to cell `k`, update `d`.
+#### Index Array Optimization
 
-In NumPy:
-
-```python
-bi = np.array(bridge_idx)
-bd = np.array(bridge_d, dtype=np.int64)
-D_sub = node.D_global[bi, :].astype(np.int64)
-sums = bd[:, np.newaxis] + D_sub              # broadcast
-np.clip(sums, 0, SENTINEL, out=sums)
-d_new = np.min(sums, axis=0)
-```
-
-This is a min-plus matrix-vector product: the "matrix" is the rows of `D_global` corresponding to bridge cells, and the "vector" is the current distances to those bridge cells.
-
-**Why this is search-free:** There are no priority queues, no visited sets, no graph traversal. It is pure algebraic computation — a sequence of matrix-vector products on precomputed tables. The number of operations is fixed by the hierarchy structure, not by the graph topology.
+An earlier implementation linearized the full ancestor chain data for each block, copying large arrays. The current approach precomputes `node_to_valid_idx` (mapping node identity to its index in the linearized tree) during `build_oracle`, then constructs small int32 index arrays (`chain_indices`, `remaining_indices`) per block. These index arrays are passed directly to `_jit_expand_indexed`, which uses them to select which nodes to process from the shared linearized tree — eliminating all redundant data copying.
 
 ### Distance Query
 
-`query_distance(oracle, s, g, goal_expansion=None)` computes the shortest path distance:
-
-1. **Localise:** find which base block contains `s` and `g`. Convert to local indices within the 4×4 block.
-2. **Same-block shortcut:** if `s` and `g` are in the same base block, read `bb.D[s_local, g_local]` as an initial upper bound.
-3. **Source-side expansion:** compute distances from `s` to its base block's boundary cells using `bb_s.D[s_local, BOUNDARY_INDICES[b]]`, then expand upward through the hierarchy via `_expand_through_hierarchy`.
-4. **Goal-side expansion:** same as source-side but starting from `g`'s boundary cells. This can be precomputed and reused (via the `goal_expansion` parameter) when multiple queries share the same goal.
-5. **Combine:** for every cell `c` reachable from both sides, compute `d_from_s[c] + d_to_g[c]`. The minimum over all such cells is the shortest path distance.
+`query_distance(oracle, s, g)` computes the shortest path distance using 144 flat table lookups:
 
 ```python
-for cell, ds in d_from_s.items():
-    dg = goal_expansion.get(cell, SENTINEL)
-    total = ds + dg
-    if total < best:
-        best = total
+@njit(cache=True)
+def _jit_query_distance(s_local, g_local, D_s, D_g, s_bids, g_bids, boundary_dist, BI):
+    best = SENTINEL
+    for a in range(12):
+        d_sa = D_s[s_local, BI[a]]
+        if d_sa >= SENTINEL: continue
+        ba = s_bids[a]
+        for b in range(12):
+            d_bg = D_g[BI[b], g_local]
+            if d_bg >= SENTINEL: continue
+            bb = g_bids[b]
+            total = d_sa + boundary_dist[ba, bb] + d_bg
+            if total < best:
+                best = total
+    return best
 ```
 
-### Path Reconstruction
+Three terms: (1) source to source-block boundary via base block D, (2) boundary-to-boundary via flat table, (3) goal-block boundary to goal via base block D. All O(1) array reads. Total: 144 iterations of 3 reads + 2 additions + 1 comparison. Runs in ~1–2μs.
 
-`reconstruct_path(oracle, s, g)` uses a greedy walk:
+### Path Reconstruction — Two Modes
 
-1. Precompute the goal-side expansion once.
-2. Starting at `s`, examine all neighbours of the current cell.
-3. For each neighbour `n`, compute `edge_weight(current, n) + query_distance(oracle, n, g)`.
+The oracle supports two reconstruction strategies, selected by the `--optimize` flag:
+
+#### Mode 1: Linked-List Retrieval (`--optimize path`)
+
+Built during oracle construction at the cost of ~60–140ms extra build time. Three structures enable ~2–3μs path retrieval:
+
+**Intra-Block Path Atlas** (`_build_atlas`):
+- `int8[blocks_r, blocks_c, 12, 12, 9]` — for every base block, stores the cell-by-cell path between each pair of boundary cells.
+- Built via greedy walk using the base block's D matrix (exact distances guarantee optimality).
+- ~324KB for a 64×64 grid (fits in L2 cache).
+
+**Boundary Adjacency List** (`_build_adjacency_flat`):
+- CSR-format arrays (`adj_neighbors`, `adj_costs`, `adj_offsets`) representing the boundary graph.
+- Edges include intra-block transfers (via the block's transfer matrix T) and cross-block grid adjacency.
+- ~320KB for a 64×64 grid.
+
+**Boundary Successor Table** (`_build_successor_jit`):
+- `int16[B, B]` — `successor[target, current]` gives the next boundary cell on the shortest path from `current` toward `target`.
+- Built via `@njit(parallel=True)` with `prange` over target cells (embarrassingly parallel).
+- Uses the flat `boundary_dist` table and adjacency list: for each (current, target) pair, finds the neighbour minimizing `edge_cost + boundary_dist[neighbour, target]`.
+- ~18MB for a 64×64 grid. Column for one target (6KB) fits in L1 cache.
+
+**Retrieval algorithm** (`_jit_retrieve_linked`):
+
+1. **Gateway selection**: Same 144-iteration loop as distance query, but also records the best source-block and goal-block boundary cells (a\*, b\*).
+2. **First mile**: Greedy walk within the source block from `s` to gateway `a*` using the base block D matrix.
+3. **Highway traversal**: Follow `successor[b*, current]` from `a*` toward `b*`. At each hop:
+   - Cross-block step: the two boundary cells are grid-adjacent, just append.
+   - Intra-block transit: read the atlas for the interior cells between the two boundary cells on the same block.
+4. **Last mile**: Greedy walk within the goal block from gateway `b*` to `g`.
+
+All operations are precomputed array reads. The JIT kernel runs in ~2–3μs.
+
+#### Mode 2: Inline Greedy Walk (`--optimize oracle`)
+
+Skips building the atlas and successor table, yielding faster oracle build (~60–140ms saved). Path reconstruction falls back to `_jit_reconstruct_inline`:
+
+1. Precompute `d(cell, goal)` for all cells in the goal's base block.
+2. Starting at `s`, at each step examine all neighbours.
+3. For each neighbour, compute `edge_weight(current, n) + d(n, goal)` where `d(n, goal)` uses the 144-lookup formula through the flat boundary table.
 4. Step to the neighbour with the smallest total cost.
-5. Repeat until reaching `g`.
 
-This is correct because the oracle returns exact distances. By the optimality principle, the neighbour `n*` minimising `w(current, n*) + d(n*, g)` is always on a shortest path. The greedy choice never makes a suboptimal step.
-
-**Performance note:** each step queries up to 8 neighbours, and each query does a full source-side hierarchical expansion. For a path of length L with 8-connectivity, that's ~8L expansions. The goal-side expansion is computed once and reused. This makes path reconstruction the most expensive query operation — significantly slower than a single distance query.
+This is correct because the flat boundary table provides exact distances. Each step does ~144 lookups × 8 neighbours = ~1152 operations. For a path of length L, total is ~1152L operations, running in ~60–400μs depending on path length.
 
 ---
 
-## 9. Pipeline Orchestration
+## 9. GPU Acceleration
+
+### GPU Boundary Table Construction
+
+**File:** `pathcircuit/gpu/boundary_gpu.py`
+
+When `--gpu` is active, the boundary table construction — the most expensive oracle build phase (~60% of total time) — runs on the GPU via a custom CUDA kernel.
+
+**Architecture:** One CUDA block per source boundary cell (3072 blocks for 64×64), with 32 cooperative threads per block.
+
+**Key design choices:**
+
+- `d_arr` (the per-source scratch array, 4096 × int32 = 16KB) lives in **shared memory**, providing ~100x faster access than global memory. With 16KB per block and ~100KB shared memory per SM, each SM can host ~6 concurrent blocks.
+
+- **Two-pass node expansion** for correctness under parallelism:
+  - *Phase 1 (gather)*: All threads cooperatively scan the node's cells, using `atomicAdd` to build a shared list of cells with known distances.
+  - *Phase 2 (scatter)*: All threads cooperatively update target cells using the gathered known-cell list. `__syncthreads()` between phases ensures consistency.
+
+  This is necessary because multiple threads updating `d_arr` in parallel could cause data races. The two-pass approach is analogous to Jacobi iteration (read all, then write all) vs Gauss-Seidel (interleaved reads and writes).
+
+- **Chain-first ordering**: Each block's ancestor chain indices are concatenated into flat arrays with per-block offsets, maintaining the bottom-up ordering that ensures correct distance propagation.
+
+**Performance:** ~2x speedup over CPU boundary table construction (~170ms vs ~360ms total oracle build for 64×64).
+
+### GPU Path Reconstruction
+
+**File:** `pathcircuit/gpu/oracle_gpu.py`
+
+A successor-field architecture for `--optimize oracle` mode:
+
+1. **Layer 1** (`dist_to_goal` kernel): Computes `d(cell, goal)` for every cell on the grid in parallel. Each CUDA block handles one base block (16 threads for 16 cells). Mid-distances are loaded into shared memory for reuse.
+
+2. **Layer 2** (`build_successor` kernel): Builds a successor field where each cell points to the neighbour minimizing `edge_cost + d(neighbour, goal)`. One thread per cell.
+
+3. **Layer 3** (CPU): Follows successor pointers from source to goal. Zero-cost per step (just integer array reads).
+
+**Note:** When `--optimize path` is active (linked-list structures available), the CPU linked-list retrieval (~2μs) is used instead of GPU reconstruction (~3ms), even when `--gpu` is set. The GPU reconstruction is only used in `--optimize oracle` mode where no linked-list exists.
+
+### GPU Dijkstra
+
+**File:** `pathcircuit/gpu/dijkstra_gpu.py`
+
+Parallel Bellman-Ford via CUDA, used for comparison only:
+- Relaxation kernel uses `atomicMin` for thread-safe distance updates.
+- Iterates until convergence (up to `rows * cols` iterations).
+- Path traceback on CPU.
+
+### CUDA Environment Setup
+
+**File:** `pathcircuit/gpu/__init__.py`
+
+`_setup_cuda_env()` preloads pip-installed NVIDIA CUDA libraries (`libnvrtc.so.12`, `libnvrtc-builtins.so.12.9`) via `ctypes.CDLL` with `RTLD_GLOBAL` mode. This is necessary when using CuPy with pip-installed CUDA libraries (as opposed to system-wide CUDA toolkit), because CuPy's `dlopen` calls need the libraries to be globally visible.
+
+---
+
+## 10. Pipeline Orchestration
 
 **File:** `pathcircuit/core/pipeline.py`
 
-The `build_pathcircuit_oracle(grid)` function ties all phases together:
+`build_pathcircuit_oracle(grid, *, build_linked_list=True, use_gpu=False)` ties all phases together:
 
 ```python
-def build_pathcircuit_oracle(grid):
+def build_pathcircuit_oracle(grid, *, build_linked_list=True, use_gpu=False):
     padded = grid.to_padded()
     N = padded.rows
 
-    # Phase 1: compute all base blocks
-    base_blocks = [[compute_base_block(br, bc, padded)
-                     for bc in range(N // 4)]
-                    for br in range(N // 4)]
-
-    # Special case: single 4×4 block needs no hierarchy
-    if N == 4:
-        bb = base_blocks[0][0]
-        bb.D_global = bb.T.copy()
-        bb.D_global_cells = list(bb.boundary_cells)
-        bb.D_global_cell_to_index = dict(bb.boundary_cell_to_index)
-        return Oracle(base_blocks=base_blocks, N=N, grid=padded)
+    # Phase 1: base blocks (parallelized if >= 64 blocks)
+    if n_blocks >= 64 and HAS_NUMBA:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            # submit compute_base_block for each (br, bc)
+    else:
+        # sequential computation
 
     # Phase 2: hierarchical composition
     root, all_nodes = build_hierarchy(base_blocks, N, padded)
@@ -590,15 +424,39 @@ def build_pathcircuit_oracle(grid):
     # Phase 3a: un-condensation
     un_condense_all(root, N)
 
-    # Phase 3b: build oracle with ancestor chains
-    return build_oracle(root, base_blocks, N, padded)
+    # Phase 3b: oracle construction
+    return build_oracle(root, base_blocks, N, padded,
+                        build_linked_list=build_linked_list,
+                        use_gpu=use_gpu)
 ```
 
-The single-block special case handles 4×4 grids that have no hierarchy: the base block's D matrix already contains all-pairs shortest paths, so no merging or un-condensation is needed.
+The `build_linked_list` flag controls whether the atlas and successor table are built (`--optimize path` vs `--optimize oracle`). The `use_gpu` flag routes boundary table construction to the CUDA kernel.
 
 ---
 
-## 10. Design Decisions and Trade-offs
+## 11. Warmup and JIT Caching
+
+**File:** `pathcircuit/warmup.py`
+
+Numba's `cache=True` persists compiled bytecode to disk, but the first-ever compilation of each kernel takes 1–3 seconds. The warmup module pre-compiles everything on startup:
+
+**`warmup_jit()`**: Builds two oracle instances on a tiny 8×8 grid — one with `build_linked_list=True` and one with `build_linked_list=False` — for both 4-connected and 8-connected modes. This ensures all JIT kernels for both `--optimize` modes are compiled:
+- `_jit_query_distance`, `_jit_reconstruct_inline` (oracle mode)
+- `_jit_retrieve_linked`, `_build_successor_jit` (path mode)
+- `_process_block_boundary`, `_jit_expand_indexed`
+- `_matmul_jit`, `_matmul_witness_jit`, `minplus_mv`
+- Comparison baselines: `dijkstra`, `astar`
+
+**`warmup_gpu()`**: Triggers NVRTC compilation of all CUDA `RawKernel` objects by running a tiny GPU oracle build and reconstruction. This avoids a multi-second stall on the first real GPU query.
+
+**Cache invalidation:** When source code changes (e.g., modifying a `@njit` function), Numba's cached `.nbi`/`.nbc` files may become stale. If performance unexpectedly regresses after code changes, clearing the cache is necessary:
+```bash
+find . -path '*/__pycache__/*' \( -name '*.nbi' -o -name '*.nbc' \) -delete
+```
+
+---
+
+## 12. Design Decisions and Trade-offs
 
 ### Why 4×4 Base Blocks?
 
@@ -607,26 +465,42 @@ The block size of 4 is the sweet spot:
 - **Large enough** that the ratio of interior to boundary cells (4:12) is meaningful — the Schur complement actually eliminates vertices and compresses information.
 - **Powers of 2** make the quadtree structure clean: each base block is 4×4, each level-0 merge produces 8×8, then 16×16, etc.
 
-### Why Store Both M_ES and M_ES×M_SS*?
+### Flat Boundary Table vs Hierarchy Traversal at Query Time
 
-The un-condensation formula for `D_SS` requires `M_SE ⊗ D_EE ⊗ M_ES` (using `M_ES`, not `M_ES × M_SS*`). The precomputed product `M_ES × M_SS*` is used for `D_ES`. Both are needed, so both are stored on the MergeNode.
+An earlier implementation traversed ancestor chains at query time, computing min-plus matrix-vector products through the hierarchy for each query. This was correct but slow (~0.5ms per distance query) because it did meaningful computation at query time.
 
-### Why Greedy Path Reconstruction Instead of Witness-Based?
+The flat boundary table eliminates this entirely: all B×B boundary distances are precomputed during build and stored in a single array. Queries become 144 flat array reads (~1–2μs). The trade-off is memory: for 64×64, the table is ~36MB. For 128×128 it would be ~576MB, which would require sparse or hierarchical approaches.
 
-The witness matrices from repeated squaring and Kleene closure could theoretically enable O(L log n) path reconstruction via recursive bisection. However:
-- The implementation complexity is significantly higher (multi-level witness chaining across the hierarchy).
-- Greedy reconstruction is simple, correct by construction, and sufficient for the grid sizes targeted (up to 64×64).
-- The witness matrices are still stored in case this optimisation is added later.
+### Linked-List Retrieval vs Inline Greedy Walk
 
-### Why the Padded Grid Is Used Everywhere (Not the Original)
+Both are correct (they use exact distances). The trade-off is oracle build time vs query time:
 
-After padding, the padded grid is passed to all phases. This means:
-- The oracle stores distances in padded coordinates.
-- Queries use padded coordinates internally.
-- The UI translates between original and padded coordinates when interacting with the oracle.
+| | Build Cost | Path Retrieval |
+|---|---|---|
+| Linked-list (`--optimize path`) | +60–140ms (atlas + successor) | ~2–3μs |
+| Inline greedy (`--optimize oracle`) | — | ~60–400μs |
 
-Using a single coordinate system throughout avoids off-by-one errors and simplifies the boundary enumeration logic. Padding cells are SENTINEL-cost obstacles, so they never participate in any shortest path.
+The linked-list approach stores precomputed "next hop" answers, reducing path retrieval to pointer chasing. The inline approach computes these answers on the fly. For interactive use (many queries on the same map), linked-list is superior. For frequently changing maps (obstacle drawing), the faster oracle build of the inline approach may be preferred.
+
+### CPU Linked-List over GPU Reconstruction
+
+When `--optimize path` is active, the CPU linked-list retrieval (~2μs) is used even with `--gpu` enabled, because:
+- The GPU successor-field reconstruction requires computing `d(cell, goal)` for ALL cells on the grid, then building a successor field — ~3ms of GPU work.
+- The CPU linked-list only touches cells along the actual path, doing ~50–70 precomputed array reads.
+- The linked-list approach is 1000x faster because it does dramatically less work.
+
+### Buffer Reuse in Boundary Table Construction
+
+Each source boundary cell's expansion needs an `int64[N*N]` scratch array initialized to SENTINEL. The original implementation allocated this inside the JIT kernel for each of the 12 boundary cells per block (12 allocations × 32KB = 384KB per block). The current implementation pre-allocates one buffer per block and reuses it across all 12 boundary cells, with an explicit `for i in range(nn): d_buf[i] = SENTINEL` reset loop. This reduces allocation pressure by 12x.
+
+### GPU Shared Memory for Boundary Table
+
+The GPU boundary table kernel places each thread's `d_arr` in shared memory (16KB per CUDA block) rather than global memory. This is critical because the hierarchy expansion accesses `d_arr` with random patterns (indexed by cell coordinates from the tree). Shared memory provides ~100x lower latency than global memory for these random accesses. The trade-off is occupancy: only ~6 blocks per SM fit in shared memory, but with 3072 blocks total and ~128 SMs, the GPU is still well-utilized.
 
 ### Why SENTINEL = 2²⁹?
 
 The value must be large enough to represent "infinity" (unreachable) but small enough that `SENTINEL + SENTINEL` doesn't overflow int32 (max 2³¹ − 1). Since 2²⁹ + 2²⁹ = 2³⁰ < 2³¹ − 1, this satisfies both constraints. It also leaves room for legitimate large distances: a 64×64 grid with all costs = 1 has a maximum shortest-path distance of about 2 × 128 = 256, far below SENTINEL.
+
+### nogil=True on Hot Kernels
+
+All Numba kernels called from `ThreadPoolExecutor` threads are decorated with `nogil=True`. Without this, Python's GIL serializes the threads, negating the parallelism. With `nogil=True`, Numba releases the GIL before entering the compiled code, enabling true concurrent execution. This is safe because each thread operates on independent data (separate blocks, separate output arrays).
